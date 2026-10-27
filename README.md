@@ -1,11 +1,11 @@
 # subs
 
 See and switch ChatGPT/Codex and Claude subscription logins: who is active,
-usage, days to reset, banked full resets.
+usage, time to reset, banked full resets.
 
 ## Install
 
-Needs `python3` plus the `codex` and/or `claude` CLI. Linux or macOS.
+Needs Rust (`cargo`), `curl`, and the `codex` and/or `claude` CLI. Linux or macOS.
 
 ```sh
 git clone git@github.com:3loc/subs.git && cd subs && make install

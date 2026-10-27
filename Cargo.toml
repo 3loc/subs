@@ -1,0 +1,15 @@
+[package]
+name = "subs"
+version = "0.2.0"
+edition = "2021"
+description = "See and switch ChatGPT/Codex and Claude subscription logins"
+repository = "https://github.com/3loc/subs"
+
+[dependencies]
+ratatui = "0.29"
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,121 @@
+//! subs - see and switch ChatGPT/Codex and Claude subscription logins.
+//!
+//! State lives in $SUBS_HOME (default ${XDG_DATA_HOME:-~/.local/share}/subs), mode 0700:
+//!
+//!     accounts.json        {provider: {email: {"password": ...}}}
+//!     codex/EMAIL.json     a saved ~/.codex/auth.json
+//!     claude/EMAIL.json    a saved Claude credential + oauthAccount
+//!
+//! Logins run in a throwaway CODEX_HOME / CLAUDE_CONFIG_DIR, so signing in to
+//! a new account never touches - or revokes - the one in use. `use` swaps the
+//! saved credential in, saving the current one first. Tokens are never
+//! refreshed here: a refresh rotates the token and kills every other copy, so
+//! that stays the job of the real CLI, which runs against the live file.
+
+mod actions;
+mod prov;
+mod status;
+mod store;
+mod tui;
+mod view;
+
+use prov::Prov;
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::process::exit;
+use std::time::Duration;
+
+const HELP: &str = "\
+usage: subs [command]
+
+  subs                              status of every account
+  subs tui                          interactive view
+  subs login codex|claude [EMAIL]   sign in; --use also makes it active
+  subs use   codex|claude EMAIL     make a saved login the active one
+  subs add   codex|claude EMAIL     store the account's password
+  subs pass  codex|claude EMAIL     copy (or print) that password
+  subs rm    codex|claude EMAIL     forget an account
+  subs json                         status as JSON";
+
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("subs: {msg}");
+    exit(1)
+}
+
+/// Fetch status, with a spinner on stderr while the providers answer.
+fn fetch() -> Vec<status::Row> {
+    if !io::stderr().is_terminal() {
+        return status::status();
+    }
+    let job = std::thread::spawn(status::status);
+    let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut i = 0;
+    while !job.is_finished() {
+        eprint!("\r\x1b[36m{}\x1b[0m \x1b[90mfetching usage\x1b[0m", spin[i % spin.len()]);
+        let _ = io::stderr().flush();
+        std::thread::sleep(Duration::from_millis(80));
+        i += 1;
+    }
+    eprint!("\r\x1b[K");
+    job.join().unwrap_or_default()
+}
+
+fn cmd_status() {
+    let rows = fetch();
+    let out = io::stdout();
+    let color = out.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let cols = ratatui::crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
+    let b = view::body(&rows, None, cols.saturating_sub(2).min(view::MAX));
+    let mut out = out.lock();
+    for l in &b.lines {
+        let _ = writeln!(out, "{}", view::ansi(l, color));
+    }
+}
+
+fn report(r: actions::Res) {
+    match r {
+        Ok(m) => println!("{m}"),
+        Err(m) => die(m),
+    }
+}
+
+fn main() {
+    let root = store::root();
+    if let Err(e) = store::mkdir(&root) {
+        die(format!("{}: {e}", root.display()));
+    }
+    // it holds passwords and live tokens
+    let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = argv.first().map_or("status", String::as_str);
+    match cmd {
+        "-h" | "--help" | "help" => return println!("{HELP}"),
+        "-V" | "--version" => return println!("subs {}", env!("CARGO_PKG_VERSION")),
+        "status" => return cmd_status(),
+        "json" => return println!("{:#}", status::to_json(&fetch())),
+        "tui" => {
+            if let Err(e) = tui::run() {
+                die(e)
+            }
+            return;
+        }
+        _ => {}
+    }
+    let args: Vec<&str> = argv[1..].iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
+    let Some(p) = args.first().and_then(|a| Prov::parse(a)) else {
+        die(format!("usage: subs {cmd} codex|claude EMAIL (subs help)"))
+    };
+    let email = args.get(1).copied();
+    if cmd == "login" {
+        return report(actions::login(p, email, argv.iter().any(|a| a == "--use")));
+    }
+    let Some(email) = email else { die(format!("usage: subs {cmd} {} EMAIL", p.name())) };
+    report(match cmd {
+        "use" => actions::use_(p, email),
+        "add" => actions::add(p, email),
+        "pass" => actions::show_password(p, email),
+        "rm" => actions::rm(p, email),
+        _ => die(format!("unknown command {cmd} (subs help)")),
+    })
+}
