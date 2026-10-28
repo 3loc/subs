@@ -14,6 +14,7 @@
 
 mod actions;
 mod prov;
+mod push;
 mod status;
 mod store;
 mod tui;
@@ -31,11 +32,16 @@ usage: subs [command]
   subs                              status of every account
   subs tui                          interactive view
   subs login codex|claude [EMAIL]   sign in; --use also makes it active
-  subs use   codex|claude EMAIL     make a saved login the active one
+  subs use   codex|claude EMAIL     make a saved login the active one and push
+                                    it to your hosts (--local: just this machine)
+  subs push  codex|claude           push the active login to your hosts again
   subs add   codex|claude EMAIL     store the account's password
   subs pass  codex|claude EMAIL     copy (or print) that password
   subs rm    codex|claude EMAIL     forget an account
-  subs json                         status as JSON";
+  subs json                         status as JSON
+
+Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
+the providers it takes (\"laptop claude\"). Offline hosts are skipped.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");
@@ -107,12 +113,39 @@ fn main() {
         die(format!("usage: subs {cmd} codex|claude EMAIL (subs help)"))
     };
     let email = args.get(1).copied();
-    if cmd == "login" {
-        return report(actions::login(p, email, argv.iter().any(|a| a == "--use")));
+    let flag = |f: &str| argv.iter().any(|a| a == f);
+    let fan = |ok: bool| {
+        if !ok || flag("--local") {
+            return;
+        }
+        if !push::cli(p) {
+            exit(1)
+        }
+    };
+    match cmd {
+        "login" => {
+            let r = actions::login(p, email, flag("--use"));
+            let ok = r.is_ok() && flag("--use");
+            report(r);
+            if ok {
+                println!();
+            }
+            return fan(ok);
+        }
+        "push" => return fan(true),
+        _ => {}
     }
     let Some(email) = email else { die(format!("usage: subs {cmd} {} EMAIL", p.name())) };
+    if cmd == "use" {
+        let r = actions::use_(p, email);
+        let switched = r.as_ref().is_ok_and(|m| !m.ends_with("is already active"));
+        report(r);
+        if switched && !flag("--local") {
+            println!();
+        }
+        return fan(switched);
+    }
     report(match cmd {
-        "use" => actions::use_(p, email),
         "add" => actions::add(p, email),
         "pass" => actions::show_password(p, email),
         "rm" => actions::rm(p, email),

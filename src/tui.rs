@@ -2,6 +2,7 @@
 
 use crate::actions::{self, Res};
 use crate::prov::{Prov, ALL};
+use crate::push::{self, Done};
 use crate::status::{self, Row};
 use crate::view::{self, fg, muted, span, ACCENT, MAX, MUTED};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,12 +20,12 @@ use std::time::{Duration, Instant};
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const KEYS: [(&str, &str); 8] = [
     ("↵", "use"),
+    ("f", "push"),
     ("l", "login"),
     ("n", "new"),
     ("a", "pass"),
     ("p", "copy"),
     ("d", "delete"),
-    ("r", "refresh"),
     ("q", "quit"),
 ];
 /// Usage is re-fetched this often; countdowns tick every frame.
@@ -43,6 +44,33 @@ enum Modal {
     Confirm { text: String, then: Then },
 }
 
+/// A fan-out in flight: one slot per host, filled as each answers.
+struct Push {
+    prov: Prov,
+    email: String,
+    note: String,
+    hosts: Vec<String>,
+    done: Vec<Option<Done>>,
+    rx: Receiver<(usize, Done)>,
+    started: Instant,
+}
+
+impl Push {
+    fn finished(&self) -> bool {
+        self.done.iter().all(Option::is_some)
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        let count = |f: fn(&Done) -> bool| self.done.iter().flatten().filter(|d| f(d)).count();
+        (count(|d| matches!(d, Done::Ok(_))), count(|d| matches!(d, Done::Offline)), count(|d| matches!(d, Done::Failed(_))))
+    }
+
+    fn summary(&self) -> (String, bool) {
+        let (ok, off, bad) = self.counts();
+        (format!("{} {} · {}", self.prov.name(), self.email, push::summary(ok, off, bad, self.hosts.len())), bad == 0)
+    }
+}
+
 #[derive(Default)]
 struct App {
     rows: Vec<Row>,
@@ -54,6 +82,7 @@ struct App {
     toast: Option<(String, bool, Instant)>,
     modal: Option<Modal>,
     login: Option<(Prov, Option<String>)>,
+    push: Option<Push>,
     quit: bool,
 }
 
@@ -71,6 +100,11 @@ impl App {
     }
 
     fn poll(&mut self) {
+        if let Some(p) = self.push.as_mut() {
+            while let Ok((i, d)) = p.rx.try_recv() {
+                p.done[i] = Some(d);
+            }
+        }
         let got = match &self.loading {
             Some((rx, _)) => rx.try_recv(),
             None => return,
@@ -100,11 +134,35 @@ impl App {
         self.toast = Some((msg, ok, Instant::now()));
     }
 
+    /// Fan `p`'s live login out to the hosts file, shown in an overlay.
+    fn start_push(&mut self, p: Prov, note: String) {
+        let hosts = push::hosts(p);
+        if hosts.is_empty() {
+            return self.say(Ok(format!("{note} · no hosts to push to, list them in {}", push::config().display())));
+        }
+        let Some(blob) = p.read(None) else { return self.say(Err(format!("no live {} login to push", p.name()))) };
+        let email = p.email(&blob).unwrap_or_default();
+        let (tx, rx) = mpsc::channel();
+        push::start(p, &hosts, blob, tx);
+        let done = hosts.iter().map(|_| None).collect();
+        self.push = Some(Push { prov: p, email, note, hosts, done, rx, started: Instant::now() });
+    }
+
     fn cur(&self) -> Option<(Prov, String, bool)> {
         self.rows.get(self.sel).map(|r| (r.prov, r.email.clone(), r.active))
     }
 
     fn key(&mut self, k: KeyEvent) {
+        if let Some(p) = self.push.take() {
+            let r = if p.finished() {
+                let (msg, ok) = p.summary();
+                if ok { Ok(msg) } else { Err(msg) }
+            } else {
+                let left = p.done.iter().filter(|d| d.is_none()).count();
+                Ok(format!("still pushing to {left} host{} in the background", if left == 1 { "" } else { "s" }))
+            };
+            return self.say(r);
+        }
         if self.modal.is_some() {
             return self.modal_key(k);
         }
@@ -125,15 +183,18 @@ impl App {
         match k.code {
             KeyCode::Enter if active => self.say(Ok(format!("{email} is already the active {} login", p.name()))),
             KeyCode::Enter => {
-                let r = actions::use_(p, &email);
-                if r.is_ok() {
-                    for row in self.rows.iter_mut().filter(|r| r.prov == p) {
-                        row.active = row.email == email;
+                match actions::use_(p, &email) {
+                    Ok(note) => {
+                        for row in self.rows.iter_mut().filter(|r| r.prov == p) {
+                            row.active = row.email == email;
+                        }
+                        self.start_push(p, note);
                     }
+                    Err(e) => self.say(Err(e)),
                 }
-                self.say(r);
                 self.refresh();
             }
+            KeyCode::Char('f') => self.start_push(p, format!("{}: pushing the active login again", p.name())),
             KeyCode::Char('l') => self.login = Some((p, Some(email))),
             KeyCode::Char('a') => {
                 self.modal = Some(Modal::Input {
@@ -273,7 +334,8 @@ pub fn run() -> io::Result<()> {
             app.refresh();
         }
         term.draw(|f| draw(f, &mut app))?;
-        let wait = if app.loading.is_some() { 80 } else { 1000 };
+        let busy = app.loading.is_some() || app.push.as_ref().is_some_and(|p| !p.finished());
+        let wait = if busy { 80 } else { 1000 };
         if event::poll(Duration::from_millis(wait))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
@@ -373,6 +435,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some(m) = &app.modal {
         modal(f, m, area);
     }
+    if let Some(p) = &app.push {
+        push_overlay(f, p, area);
+    }
 }
 
 fn modal(f: &mut Frame, m: &Modal, area: Rect) {
@@ -423,5 +488,45 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
             Line::from(vec![span("y", Style::new().add_modifier(Modifier::BOLD)), muted(" forget · any other key keeps it")]),
         ],
     };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
+    let w = 64.min(area.width - 4);
+    let h = (p.hosts.len() as u16 + 8).min(area.height - 2);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let title = format!(" push {} · {} ", p.prov.name(), p.email);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(fg(ACCENT))
+        .title(Line::from(span(title, fg(ACCENT).add_modifier(Modifier::BOLD))));
+    let inner = block.inner(r).inner(Margin { horizontal: 2, vertical: 1 });
+    f.render_widget(Clear, r);
+    f.render_widget(block, r);
+    let spin = SPIN[(p.started.elapsed().as_millis() / 80) as usize % SPIN.len()];
+    let hw = p.hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0) + 2;
+    let room = (inner.width as usize).saturating_sub(hw + 2);
+    let mut lines = vec![Line::from(muted(p.note.clone())), Line::default()];
+    for (host, d) in p.hosts.iter().zip(&p.done) {
+        let (icon, ic, text, tc) = match d {
+            None => (spin, ACCENT, "pushing…".to_string(), MUTED),
+            Some(Done::Ok(m)) => ("✓", Color::Green, m.clone(), MUTED),
+            Some(Done::Offline) => ("○", MUTED, "offline".to_string(), MUTED),
+            Some(Done::Failed(m)) => ("✗", Color::Red, m.clone(), Color::Red),
+        };
+        lines.push(Line::from(vec![
+            span(format!("{icon} "), fg(ic)),
+            span(format!("{host:<hw$}"), Style::new()),
+            span(text.chars().take(room).collect::<String>(), fg(tc)),
+        ]));
+    }
+    lines.push(Line::default());
+    let n = p.done.iter().flatten().count();
+    lines.push(if p.finished() {
+        let (ok, off, bad) = p.counts();
+        Line::from(vec![muted(push::summary(ok, off, bad, p.hosts.len())), muted(" · any key closes")])
+    } else {
+        Line::from(muted(format!("{n} of {} done · any key hides this, the push carries on", p.hosts.len())))
+    });
     f.render_widget(Paragraph::new(lines), inner);
 }

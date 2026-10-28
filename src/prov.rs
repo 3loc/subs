@@ -71,19 +71,10 @@ impl Prov {
         match self {
             Prov::Codex => rjson(&dir.map(Path::to_path_buf).unwrap_or_else(codex_home).join("auth.json")),
             Prov::Claude => {
-                let cred: Value = if claude_keychain(dir) {
-                    let o = Command::new("security")
-                        .args(["find-generic-password", "-s", KEYCHAIN, "-w"])
-                        .stderr(Stdio::null())
-                        .output()
-                        .ok()?;
-                    if !o.status.success() {
-                        return None;
-                    }
-                    serde_json::from_slice(&o.stdout).ok()?
-                } else {
-                    rjson(&dir.map(Path::to_path_buf).unwrap_or_else(claude_cfg).join(".credentials.json"))?
-                };
+                // Claude reads the keychain first and falls back to the file,
+                // which is also where `subs push` leaves a Mac's login.
+                let file = || rjson(&dir.map(Path::to_path_buf).unwrap_or_else(claude_cfg).join(".credentials.json"));
+                let cred = if claude_keychain(dir) { keychain().or_else(file)? } else { file()? };
                 let mut acct = rjson(&claude_state(dir))
                     .map(|s| s["oauthAccount"].clone())
                     .filter(|a| a.is_object());
@@ -233,6 +224,15 @@ fn claude_usage(blob: &Value) -> Result<Usage, String> {
     }
     let limited = windows.iter().any(|w| w.pct.unwrap_or(0.0) >= 100.0);
     Ok(Usage { plan: Some(plan), windows, resets: None, extra, limited })
+}
+
+fn keychain() -> Option<Value> {
+    let o = Command::new("security")
+        .args(["find-generic-password", "-s", KEYCHAIN, "-w"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    o.status.success().then(|| serde_json::from_slice(&o.stdout).ok()).flatten()
 }
 
 /// The account behind a Claude token, shaped like ~/.claude.json's oauthAccount.
