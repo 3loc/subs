@@ -1,9 +1,8 @@
 //! The account cards, shared by the TUI and `subs` status output.
 //!
-//!   codex ──────────────────────────────────────────────────────
-//! ▎ ● ana@example.com                      2 resets · prolite
-//! ▎   5h   ━━━━━━━━━━━━━━──────────────────────────  31%   ↻ 2h 14m
-//! ▎   7d   ━━━━━━━━━━━━━━━━━━━━━━━━━━━─────────────  58%    ↻ 3d 4h
+//!   codex ────────────────────────────────────────────────────────────────
+//! ▎ ● ana@example.com                       1 full reset left · prolite
+//! ▎   weekly  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━─  97% left   resets in 6d 19h
 
 use crate::prov::{Win, ALL};
 use crate::status::{until, Row};
@@ -13,9 +12,9 @@ use ratatui::text::{Line, Span};
 pub const ACCENT: Color = Color::Cyan;
 pub const MUTED: Color = Color::DarkGray;
 /// Widest the card column grows; past this bars stop stretching.
-pub const MAX: usize = 70;
+pub const MAX: usize = 76;
 /// Columns a window line uses besides its bar.
-const FIXED: usize = 25;
+const FIXED: usize = 41;
 
 pub fn span(t: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(t.into(), style)
@@ -112,16 +111,16 @@ fn meta(r: &Row) -> Vec<Span<'static>> {
     let Ok(u) = &r.usage else { return vec![] };
     let mut parts: Vec<Vec<Span<'static>>> = vec![];
     if u.limited {
-        parts.push(vec![span("limited", fg(Color::Red).add_modifier(Modifier::BOLD))]);
+        parts.push(vec![span("used up", fg(Color::Red).add_modifier(Modifier::BOLD))]);
     }
     if let Some(x) = &u.extra {
         parts.push(vec![muted(x.clone())]);
     }
     match u.resets {
-        Some(0) => parts.push(vec![muted("no resets")]),
+        Some(0) => parts.push(vec![muted("no full resets")]),
         Some(n) => parts.push(vec![
             span(n.to_string(), fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            muted(if n == 1 { " reset" } else { " resets" }),
+            muted(if n == 1 { " full reset left" } else { " full resets left" }),
         ]),
         None => {}
     }
@@ -139,26 +138,36 @@ fn meta(r: &Row) -> Vec<Span<'static>> {
 }
 
 fn window(edge: Span<'static>, w: &Win, bw: usize) -> Line<'static> {
-    let mut l = vec![edge, span("   ", Style::new()), muted(format!("{:<4}", w.label)), span(" ", Style::new())];
-    match w.pct {
-        Some(p) => {
-            let c = level(p);
-            let halves = (p.clamp(0.0, 100.0) / 100.0 * (bw * 2) as f64).round() as usize;
+    let label = match w.label.as_str() {
+        "5h" => "5-hour",
+        "1d" => "daily",
+        "7d" => "weekly",
+        "30d" => "monthly",
+        l => l,
+    };
+    let mut l = vec![edge, span("   ", Style::new()), muted(format!("{label:<8}"))];
+    // The bar is a fuel gauge: what is still left, on a track of what is used.
+    match w.pct.map(|used| 100.0 - used.clamp(0.0, 100.0)) {
+        Some(left) => {
+            let c = level(100.0 - left);
+            let halves = (left / 100.0 * (bw * 2) as f64).round() as usize;
             let (full, half) = (halves / 2, halves % 2 == 1);
             l.push(span("━".repeat(full), fg(c)));
             if half {
                 l.push(span("╾", fg(c)));
             }
             l.push(muted("─".repeat(bw - full - half as usize)));
-            let bold = if p >= 90.0 { Modifier::BOLD } else { Modifier::empty() };
-            l.push(span(format!("{:>5}", format!("{p:.0}%")), fg(c).add_modifier(bold)));
+            let bold = if left <= 10.0 { Modifier::BOLD } else { Modifier::empty() };
+            l.push(span(format!("{:>5}", format!("{left:.0}%")), fg(c).add_modifier(bold)));
+            l.push(muted(" left"));
         }
         None => {
             l.push(muted("─".repeat(bw)));
-            l.push(muted("    –"));
+            l.push(muted("    – left"));
         }
     }
-    l.push(muted(format!("{:>11}", w.reset.map(|t| format!("↻ {}", until(t))).unwrap_or_default())));
+    let reset = w.reset.map(|t| format!("resets in {}", until(t))).unwrap_or_default();
+    l.push(muted(format!("{reset:>19}")));
     Line::from(l)
 }
 
