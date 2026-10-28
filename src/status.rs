@@ -16,6 +16,9 @@ pub struct Row {
 
 /// Every saved or live account. The live one is re-saved so its copy stays current.
 pub fn status() -> Vec<Row> {
+    if crate::demo::on() {
+        return crate::demo::rows();
+    }
     let acc = store::accounts();
     let mut todo = vec![];
     for p in ALL {
@@ -56,7 +59,7 @@ pub fn status() -> Vec<Row> {
 fn fetch(p: Prov, blob: &Value, active: bool) -> Result<Usage, String> {
     if p.expires(blob).is_some_and(|t| t < now()) {
         return Err(if active {
-            format!("token expired · run {} to refresh it", p.name())
+            format!("token expired · run {} once, or sign in again with l", p.name())
         } else {
             "token expired · refreshes once in use".into()
         });

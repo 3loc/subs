@@ -26,22 +26,36 @@ fn running(name: &str) -> usize {
 
 /// Swap a saved login in, saving the current one first.
 pub fn use_(p: Prov, email: &str) -> Res {
+    activate(p, email, false)
+}
+
+/// `force` rewrites the login even when the same account is already live,
+/// which is how a fresh sign-in replaces a dead token.
+fn activate(p: Prov, email: &str, force: bool) -> Res {
+    if crate::demo::on() {
+        return Ok(crate::demo::switch(email));
+    }
     let name = p.name();
     let blob = rjson(&snap_path(p, email))
         .ok_or_else(|| format!("no saved {name} login for {email} · subs login {name} {email}"))?;
     let live = p.read(None);
     let cur = live.as_ref().and_then(|b| p.email(b));
-    if cur.as_deref() == Some(email) {
+    let same = cur.as_deref() == Some(email);
+    if same && !force {
         return Ok(format!("{name}: {email} is already active"));
     }
-    if let (Some(c), Some(l)) = (&cur, &live) {
+    if let (Some(c), Some(l), false) = (&cur, &live, same) {
         wjson(&snap_path(p, c), l).map_err(io)?;
     }
     p.write(&blob)?;
-    let mut msg = format!("{name}: {} → {email}", cur.as_deref().unwrap_or("–"));
+    let mut msg = if same {
+        format!("{name}: {email} signed in again")
+    } else {
+        format!("{name}: {} → {email}", cur.as_deref().unwrap_or("–"))
+    };
     match running(name) {
         0 => {}
-        n => msg += &format!(" · restart the {n} running {name} process{}", if n == 1 { "" } else { "es" }),
+        n => msg += &format!(" · restart {n} {name} session{}", if n == 1 { "" } else { "s" }),
     }
     Ok(msg)
 }
@@ -90,20 +104,21 @@ pub fn rm(p: Prov, email: &str) -> Res {
     Ok(format!("{}: forgot {email}", p.name()))
 }
 
+pub struct Login {
+    pub email: String,
+    /// The new login is now the one this machine uses.
+    pub live: bool,
+    pub msg: String,
+}
+
 /// Sign in with the real CLI in a throwaway home, so the login in use is
-/// never touched, then save the result.
-pub fn login(p: Prov, email: Option<&str>, activate: bool) -> Res {
+/// never touched, then save the result. Signing in again as the account
+/// that is already live replaces its token, since that is the point of it.
+pub fn login(p: Prov, email: Option<&str>, use_it: bool) -> Result<Login, String> {
     let name = p.name();
-    if let Some(e) = email {
-        if password(p, e).is_none() && io::stdin().is_terminal() {
-            let pw = read_secret(&format!("password for {name} {e} (enter to skip): "));
-            if !pw.is_empty() {
-                store_password(p, e, &pw)?;
-            }
-        }
-        match show_password(p, e) {
-            Ok(m) | Err(m) => println!("{m}"),
-        }
+    // A stored password goes on the clipboard, ready for the browser.
+    if let Some(m) = email.filter(|e| password(p, e).is_some()).and_then(|e| show_password(p, e).ok()) {
+        println!("{m}");
     }
     let dir = store::root().join(name);
     store::mkdir(&dir).map_err(io)?;
@@ -134,17 +149,19 @@ pub fn login(p: Prov, email: Option<&str>, activate: bool) -> Res {
         println!("signed in as {got}, not {} · saved under {got}", email.unwrap_or_default());
     }
     wjson(&snap_path(p, &got), &blob).map_err(io)?;
-    if inplace && !activate {
-        if let Some(b) = before.filter(|b| p.email(b).as_deref() != Some(got.as_str())) {
-            p.write(&b)?;
+    let again = before.as_ref().and_then(|b| p.email(b)).as_deref() == Some(got.as_str());
+    let live = use_it || again;
+    if inplace && !live {
+        if let Some(b) = &before {
+            p.write(b)?;
         }
     }
-    let saved = format!("{name}: saved {got}");
-    match (activate, inplace) {
-        (false, _) => Ok(saved),
-        (true, true) => Ok(format!("{saved} · now active")),
-        (true, false) => use_(p, &got).map(|m| format!("{saved} · {}", m.trim_start_matches(&format!("{name}: ")))),
-    }
+    let msg = match (live, inplace) {
+        (false, _) => format!("{name}: saved {got}"),
+        (true, true) => format!("{name}: {got} signed in and active"),
+        (true, false) => activate(p, &got, true)?,
+    };
+    Ok(Login { email: got, live, msg })
 }
 
 pub fn clip(text: &str) -> bool {

@@ -13,6 +13,7 @@
 //! that stays the job of the real CLI, which runs against the live file.
 
 mod actions;
+mod demo;
 mod prov;
 mod push;
 mod status;
@@ -124,13 +125,14 @@ fn main() {
     };
     match cmd {
         "login" => {
-            let r = actions::login(p, email, flag("--use"));
-            let ok = r.is_ok() && flag("--use");
-            report(r);
-            if ok {
+            let l = actions::login(p, email, flag("--use")).unwrap_or_else(|e| die(e));
+            println!("{}", l.msg);
+            if !l.live {
+                println!("make it the active login with: subs use {} {}", p.name(), l.email);
+            } else if !flag("--local") {
                 println!();
             }
-            return fan(ok);
+            return fan(l.live);
         }
         "push" => return fan(true),
         _ => {}

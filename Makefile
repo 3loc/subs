@@ -16,7 +16,11 @@ uninstall:
 test:
 	cargo test --locked
 
+# README recordings; needs vhs (github.com/charmbracelet/vhs). Demo data only.
+gifs: $(BIN)
+	for t in status tui use; do vhs docs/$$t.tape; done
+
 clean:
 	cargo clean
 
-.PHONY: all install uninstall test clean
+.PHONY: all install uninstall test clean gifs

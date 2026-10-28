@@ -5,7 +5,10 @@ use crate::prov::{Prov, ALL};
 use crate::push::{self, Done};
 use crate::status::{self, Row};
 use crate::view::{self, fg, muted, span, ACCENT, MAX, MUTED};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, PopKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{cursor, execute};
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
@@ -36,12 +39,13 @@ enum Then {
     NewLogin(Prov),
     Password(Prov, String),
     Forget(Prov, String),
+    Use(Prov, String),
 }
 
 enum Modal {
     Pick { idx: usize },
     Input { title: String, prompt: String, value: String, secret: bool, then: Then },
-    Confirm { text: String, then: Then },
+    Confirm { title: String, text: String, detail: String, verb: &'static str, danger: bool, then: Then },
 }
 
 /// A fan-out in flight: one slot per host, filled as each answers.
@@ -140,12 +144,51 @@ impl App {
         if hosts.is_empty() {
             return self.say(Ok(format!("{note} · no hosts to push to, list them in {}", push::config().display())));
         }
-        let Some(blob) = p.read(None) else { return self.say(Err(format!("no live {} login to push", p.name()))) };
-        let email = p.email(&blob).unwrap_or_default();
+        let (blob, email) = if crate::demo::on() {
+            (serde_json::Value::Null, crate::demo::ACTIVE.lock().unwrap().to_string())
+        } else {
+            let Some(blob) = p.read(None) else { return self.say(Err(format!("no live {} login to push", p.name()))) };
+            let email = p.email(&blob).unwrap_or_default();
+            (blob, email)
+        };
         let (tx, rx) = mpsc::channel();
         push::start(p, &hosts, blob, tx);
         let done = hosts.iter().map(|_| None).collect();
         self.push = Some(Push { prov: p, email, note, hosts, done, rx, started: Instant::now() });
+    }
+
+    /// Make `email` the live login here, then push it to the hosts.
+    fn switch(&mut self, p: Prov, email: &str) {
+        match actions::use_(p, email) {
+            Ok(note) => {
+                for row in self.rows.iter_mut().filter(|r| r.prov == p) {
+                    row.active = row.email == email;
+                }
+                self.start_push(p, note);
+            }
+            Err(e) => self.say(Err(e)),
+        }
+        self.refresh();
+    }
+
+    /// After a sign-in: a re-login of the live account goes out at once,
+    /// any other account asks first.
+    fn signed_in(&mut self, p: Prov, l: actions::Login) {
+        if l.live {
+            self.start_push(p, l.msg);
+        } else {
+            let n = push::hosts(p).len();
+            let hosts = if n == 0 { String::new() } else { format!(" and {n} host{}", if n == 1 { "" } else { "s" }) };
+            self.modal = Some(Modal::Confirm {
+                title: "signed in".into(),
+                text: format!("Use {} for {} now?", l.email, p.name()),
+                detail: format!("it goes live on this machine{hosts}"),
+                verb: "use it",
+                danger: false,
+                then: Then::Use(p, l.email),
+            });
+        }
+        self.refresh();
     }
 
     fn cur(&self) -> Option<(Prov, String, bool)> {
@@ -169,7 +212,8 @@ impl App {
         let n = self.rows.len();
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Not Esc: a terminal answering a query can send a stray one.
+            KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab if n > 0 => self.sel = (self.sel + 1) % n,
             KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab if n > 0 => self.sel = (self.sel + n - 1) % n,
@@ -183,16 +227,7 @@ impl App {
         match k.code {
             KeyCode::Enter if active => self.say(Ok(format!("{email} is already the active {} login", p.name()))),
             KeyCode::Enter => {
-                match actions::use_(p, &email) {
-                    Ok(note) => {
-                        for row in self.rows.iter_mut().filter(|r| r.prov == p) {
-                            row.active = row.email == email;
-                        }
-                        self.start_push(p, note);
-                    }
-                    Err(e) => self.say(Err(e)),
-                }
-                self.refresh();
+                self.switch(p, &email);
             }
             KeyCode::Char('f') => self.start_push(p, format!("{}: pushing the active login again", p.name())),
             KeyCode::Char('l') => self.login = Some((p, Some(email))),
@@ -215,7 +250,11 @@ impl App {
             }
             KeyCode::Char('d') => {
                 self.modal = Some(Modal::Confirm {
+                    title: "forget".into(),
                     text: format!("Forget the {} login {email}?", p.name()),
+                    detail: "its saved login and password are deleted".into(),
+                    verb: "forget",
+                    danger: true,
                     then: Then::Forget(p, email),
                 })
             }
@@ -285,6 +324,7 @@ impl App {
                 }
                 self.say(r);
             }
+            Then::Use(p, email) => self.switch(p, &email),
             Then::Forget(p, email) => {
                 let r = actions::rm(p, &email);
                 if r.is_ok() {
@@ -300,7 +340,21 @@ impl App {
 
 fn enter() -> io::Result<()> {
     terminal::enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, cursor::Hide)
+    // A CLI that ran in between (claude, codex) can leave its keyboard and
+    // focus modes on, and answers to its terminal queries still queued.
+    execute!(
+        stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableMouseCapture,
+        EnterAlternateScreen,
+        cursor::Hide
+    )?;
+    while event::poll(Duration::from_millis(30))? {
+        let _ = event::read()?;
+    }
+    Ok(())
 }
 
 fn leave() -> io::Result<()> {
@@ -322,16 +376,20 @@ pub fn run() -> io::Result<()> {
         app.poll();
         if let Some((p, email)) = app.login.take() {
             leave()?;
-            println!("\n  subs · signing in to {}\n", p.name());
+            let who = email.as_deref().map(|e| format!(" as {e}")).unwrap_or_default();
+            println!("\n\x1b[1;36msubs\x1b[0m · signing in to {}{who}", p.name());
+            println!("\x1b[90mfollow the link, finish in the browser; you come back here when it is done\x1b[0m\n");
             let r = actions::login(p, email.as_deref(), false);
             if let Err(e) = &r {
-                eprintln!("\n  {e} · press enter to return");
+                eprintln!("\n\x1b[31m✗ {e}\x1b[0m · press enter to go back");
                 let _ = io::stdin().lock().read_line(&mut String::new());
             }
             enter()?;
             term.clear()?;
-            app.say(r);
-            app.refresh();
+            match r {
+                Ok(l) => app.signed_in(p, l),
+                Err(e) => app.say(Err(e)),
+            }
         }
         term.draw(|f| draw(f, &mut app))?;
         let busy = app.loading.is_some() || app.push.as_ref().is_some_and(|p| !p.finished());
@@ -447,7 +505,7 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
     let (title, color) = match m {
         Modal::Pick { .. } => ("new login", ACCENT),
         Modal::Input { title, .. } => (title.as_str(), ACCENT),
-        Modal::Confirm { .. } => ("forget", Color::Red),
+        Modal::Confirm { title, danger, .. } => (title.as_str(), if *danger { Color::Red } else { ACCENT }),
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -481,11 +539,11 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
                 hint("enter ok · esc cancel"),
             ]
         }
-        Modal::Confirm { text, .. } => vec![
+        Modal::Confirm { text, detail, verb, .. } => vec![
             Line::from(text.clone()),
-            hint("its saved login and password are deleted"),
+            hint(detail),
             Line::default(),
-            Line::from(vec![span("y", Style::new().add_modifier(Modifier::BOLD)), muted(" forget · any other key keeps it")]),
+            Line::from(vec![span("y", Style::new().add_modifier(Modifier::BOLD)), muted(format!(" {verb} · any other key cancels"))]),
         ],
     };
     f.render_widget(Paragraph::new(lines), inner);
@@ -493,7 +551,8 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
 
 fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
     let w = 64.min(area.width - 4);
-    let h = (p.hosts.len() as u16 + 8).min(area.height - 2);
+    let notes = wrap(&p.note, w.saturating_sub(6) as usize).len() as u16;
+    let h = (p.hosts.len() as u16 + 7 + notes).min(area.height - 2);
     let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     let title = format!(" push {} · {} ", p.prov.name(), p.email);
     let block = Block::bordered()
@@ -506,7 +565,8 @@ fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
     let spin = SPIN[(p.started.elapsed().as_millis() / 80) as usize % SPIN.len()];
     let hw = p.hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0) + 2;
     let room = (inner.width as usize).saturating_sub(hw + 2);
-    let mut lines = vec![Line::from(muted(p.note.clone())), Line::default()];
+    let mut lines: Vec<Line> = wrap(&p.note, inner.width as usize).into_iter().map(|l| Line::from(muted(l))).collect();
+    lines.push(Line::default());
     for (host, d) in p.hosts.iter().zip(&p.done) {
         let (icon, ic, text, tc) = match d {
             None => (spin, ACCENT, "pushing…".to_string(), MUTED),
@@ -529,4 +589,19 @@ fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
         Line::from(muted(format!("{n} of {} done · any key hides this, the push carries on", p.hosts.len())))
     });
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Break `text` into lines of at most `width` columns at spaces.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for word in text.split(' ') {
+        match out.last_mut() {
+            Some(l) if l.chars().count() + 1 + word.chars().count() <= width => {
+                l.push(' ');
+                l.push_str(word);
+            }
+            _ => out.push(word.to_string()),
+        }
+    }
+    out
 }

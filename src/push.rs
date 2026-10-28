@@ -37,6 +37,9 @@ pub fn config() -> PathBuf {
 
 /// The hosts that take `p`'s login, minus this machine.
 pub fn hosts(p: Prov) -> Vec<String> {
+    if crate::demo::on() {
+        return crate::demo::HOSTS.map(String::from).to_vec();
+    }
     let Ok(text) = std::fs::read_to_string(config()) else { return vec![] };
     let me = local_names();
     let mut out: Vec<String> = vec![];
@@ -63,6 +66,9 @@ fn local_names() -> Vec<String> {
 
 /// Push `blob` to every host in parallel; each result goes to `tx` as it lands.
 pub fn start(p: Prov, hosts: &[String], blob: Value, tx: Sender<(usize, Done)>) {
+    if crate::demo::on() {
+        return crate::demo::start(tx);
+    }
     for (i, host) in hosts.iter().enumerate() {
         let (host, blob, tx) = (host.clone(), blob.clone(), tx.clone());
         thread::spawn(move || {
@@ -269,11 +275,16 @@ pub fn cli(p: Prov) -> bool {
         println!("{}: no hosts to push to · list them in {}", p.name(), config().display());
         return true;
     }
-    let Some(blob) = p.read(None) else {
-        eprintln!("subs: no live {} login to push", p.name());
-        return false;
+    let blob = if crate::demo::on() {
+        serde_json::json!({"demo": true})
+    } else {
+        let Some(b) = p.read(None) else {
+            eprintln!("subs: no live {} login to push", p.name());
+            return false;
+        };
+        b
     };
-    let email = p.email(&blob).unwrap_or_default();
+    let email = if crate::demo::on() { crate::demo::ACTIVE.lock().unwrap().to_string() } else { p.email(&blob).unwrap_or_default() };
     let color = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none();
     let paint = |code: &str, s: &str| if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() };
     println!("{}: pushing {email} to {} host{}", p.name(), hosts.len(), if hosts.len() == 1 { "" } else { "s" });
@@ -281,7 +292,25 @@ pub fn cli(p: Prov) -> bool {
     start(p, &hosts, blob, tx);
     let w = hosts.iter().map(String::len).max().unwrap_or(0);
     let (mut ok, mut off, mut bad) = (0, vec![], 0);
-    for (i, d) in rx.iter().take(hosts.len()) {
+    // While hosts answer, one live line names who is still being waited on.
+    let live = color && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut waiting: Vec<bool> = vec![true; hosts.len()];
+    let started = Instant::now();
+    let mut got = 0;
+    while got < hosts.len() {
+        if live {
+            let names: Vec<&str> = hosts.iter().zip(&waiting).filter(|(_, w)| **w).map(|(h, _)| h.as_str()).collect();
+            let frame = spin[(started.elapsed().as_millis() / 80) as usize % spin.len()];
+            print!("\r\x1b[K  {} {}", paint("36", frame), paint("90", &format!("waiting for {}", names.join(", "))));
+            let _ = std::io::stdout().flush();
+        }
+        let Ok((i, d)) = rx.recv_timeout(Duration::from_millis(80)) else { continue };
+        got += 1;
+        waiting[i] = false;
+        if live {
+            print!("\r\x1b[K");
+        }
         let h = format!("{:<w$}", hosts[i]);
         match d {
             Done::Ok(m) => {
@@ -298,6 +327,7 @@ pub fn cli(p: Prov) -> bool {
             }
         }
     }
+    println!();
     println!("{}", summary(ok, off.len(), bad, hosts.len()));
     if !off.is_empty() {
         println!("offline hosts get it on the next: subs push {}", p.name());
