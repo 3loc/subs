@@ -1,7 +1,7 @@
 //! The account cards, shared by the TUI and `subs` status output.
 //!
 //!   codex ────────────────────────────────────────────────────────────────
-//! ▎ ● ana@example.com                       1 full reset left · prolite
+//! ▎ ● ana@example.com                          1 full reset left · prolite
 //! ▎   weekly  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━─  97% left   resets in 6d 19h
 
 use crate::prov::{Win, ALL};
