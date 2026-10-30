@@ -32,6 +32,9 @@ pub fn status() -> Vec<Row> {
             emails.extend(m.keys().cloned());
         }
         emails.extend(cur.clone());
+        if emails.is_empty() {
+            todo.push((p, String::new(), false, false, None));
+        }
         for email in emails {
             let active = cur.as_deref() == Some(email.as_str());
             let blob = if active { live.clone() } else { rjson(&snap_path(p, &email)) };
@@ -39,6 +42,7 @@ pub fn status() -> Vec<Row> {
             todo.push((p, email, active, password, blob));
         }
     }
+    todo.push((Prov::Bifrost, crate::prov::bifrost::KEY.into(), false, false, Some(Value::Null)));
     thread::scope(|s| {
         let jobs: Vec<_> = todo
             .into_iter()
@@ -86,9 +90,13 @@ pub fn to_json(rows: &[Row]) -> Value {
         .map(|r| {
             let mut o = json!({"provider": r.prov.name(), "email": r.email, "active": r.active, "password": r.password});
             match &r.usage {
-                Err(e) => o["err"] = json!(e),
+                Err(e) => {
+                    o["err"] = json!(e);
+                    o["spend"] = crate::prov::Spend::unknown(e).json();
+                },
                 Ok(u) => {
                     o["plan"] = json!(u.plan);
+                    o["spend"] = u.spend.json();
                     o["windows"] = u.windows.iter().map(|w| json!([w.label, w.pct, w.reset])).collect();
                     o["resets"] = json!(u.resets);
                     o["extra"] = json!(u.extra);
@@ -98,4 +106,18 @@ pub fn to_json(rows: &[Row]) -> Value {
             o
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_spend_is_null_with_reason() {
+        let rows = [Row { prov: Prov::Bifrost, email: crate::prov::bifrost::KEY.into(), active: false, password: false, usage: Err("unavailable: virtual key not deployed or not visible".into()) }];
+        let v = to_json(&rows);
+        assert!(v[0]["spend"]["used"].is_null());
+        assert!(v[0]["spend"]["cap"].is_null());
+        assert_eq!(v[0]["spend"]["reason"], rows[0].usage.as_ref().err().unwrap().as_str());
+        assert!(Prov::parse("bifrost").is_none());
+    }
 }

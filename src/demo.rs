@@ -19,7 +19,7 @@ fn win(label: &str, used: f64, hours: f64) -> Win {
 }
 
 fn row(prov: Prov, email: &str, active: bool, plan: &str, windows: Vec<Win>, resets: Option<i64>) -> Row {
-    let usage = Usage { plan: Some(plan.into()), windows, resets, extra: None, limited: false };
+    let usage = Usage { spend: crate::prov::Spend::unknown("flat subscription; dollar spend not exposed"), plan: Some(plan.into()), windows, resets, extra: None, limited: false };
     Row { prov, email: email.into(), active, password: true, usage: Ok(usage) }
 }
 

@@ -4,7 +4,7 @@
 //! ▎ ● ana@example.com                          1 full reset left · prolite
 //! ▎   weekly  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━─  97% left   resets in 6d 19h
 
-use crate::prov::{Win, ALL};
+use crate::prov::{Win, DISPLAY};
 use crate::status::{until, Row};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -60,7 +60,7 @@ pub fn body(rows: &[Row], sel: Option<usize>, cols: usize) -> Body {
     let cw = bw + FIXED;
     let mut lines = vec![];
     let mut spans = vec![(0, 0); rows.len()];
-    for p in ALL {
+    for p in DISPLAY {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
@@ -91,7 +91,7 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     let dot = if r.active { span("●", fg(Color::Green)) } else { muted("○") };
     let meta = meta(r);
     let room = cw.saturating_sub(4 + width(&meta) + 2).max(8);
-    let email = trunc(&r.email, room);
+    let email = trunc(if r.email.is_empty() { "no login" } else { &r.email }, room);
     let style = if selected { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
     let pad = cw.saturating_sub(4 + email.chars().count() + width(&meta));
     let mut head = vec![edge.clone(), span(" ", Style::new()), dot, span(" ", Style::new()), span(email, style)];
@@ -99,9 +99,12 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     head.extend(meta);
     let mut out = vec![Line::from(head)];
     match &r.usage {
-        Err(e) => out.push(Line::from(vec![edge, span(format!("   ✗ {e}"), fg(Color::Red))])),
+        Err(e) => out.push(Line::from(vec![edge, span(format!("   spend n/a · {e}"), fg(Color::Red))])),
         Ok(u) if u.windows.is_empty() => out.push(Line::from(vec![edge, muted("   no usage reported")])),
         Ok(u) => out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw))),
+    }
+    if let Ok(u) = &r.usage {
+        out.push(Line::from(vec![muted(format!("    spend {}", u.spend.summary()))]));
     }
     out
 }

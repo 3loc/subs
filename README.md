@@ -61,5 +61,33 @@ Cursor uses `cursor-agent login`, isolated via `XDG_CONFIG_HOME` on Linux or
 `HOME` on macOS. Auth lives in `~/.config/cursor/auth.json` on Linux
 (`$XDG_CONFIG_HOME/cursor/auth.json` when set), or `~/.cursor/auth.json` on
 macOS. Email comes from JWT claims or `cursor-agent status --format json`;
-JWT expiry is checked when available. Cursor usage currently shows `usage n/a`.
+JWT expiry is checked when available. Plan and usage come from the same read-only DashboardService
+queries as `cursor-agent`’s `/usage`: included usage percentage and on-demand
+USD spend (converted from reported cents). Missing fields stay unknown.
 Push writes the default auth path on each host without stopping processes.
+
+## Spending
+
+Status cards (including the TUI) show spend per account. `subs json` adds a
+`spend` object with `used`, `cap`, `currency`, `period`, and `reason`. Unknown
+amounts are null, never zero. Codex and Claude show the provider’s plan and
+usage windows; subscription dollar spend is n/a because those APIs do not
+expose it. Cursor reports on-demand charges separately from its flat subscription.
+Providers without a login still appear, with unknown spend. Credits are labelled as credits, without converting them to dollars.
+
+Bifrost shows the OpenRouter dev virtual key `neocat-demo-dev-20261030`, with
+its governance budget’s current USD usage, cap, and reset period. Its intended
+cap is USD 10; the displayed cap always comes from the API. Missing keys,
+budgets, or credentials show `unavailable` with a reason. It is read-only and
+cannot be selected for login, password, switching, deletion, or push actions.
+
+The Bifrost module reads `/bifrost/prod/ADMIN_USERNAME` and
+`/bifrost/prod/ADMIN_PASSWORD` from AWS SSM in `us-east-1`, using the existing
+`fansvine` SSH host and its AWS identity. Set `SUBS_BIFROST_SSM_HOST` to another
+SSH alias, or an empty value to use local AWS credentials. SSH requires `timeout`
+(GNU coreutils, also available on macOS). It then sends only GET requests to
+`https://bifrost.fansvine.com/api/governance/virtual-keys` and the matching key’s
+detail endpoint. Credentials travel through captured pipes and curl stdin;
+no admin credentials or virtual key values enter status output or saved state.
+Spend is fetched on demand with the existing refresh, without an accounting
+cache or background service.

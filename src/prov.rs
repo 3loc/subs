@@ -1,6 +1,11 @@
 //! Providers. Each reads and writes its live credential "blob", names the
 //! account in it, and asks the provider - not the token - for plan and usage.
 
+mod codex;
+mod claude;
+mod cursor;
+pub mod bifrost;
+
 use crate::store::{env_path, home, rjson, wjson};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -12,9 +17,11 @@ pub enum Prov {
     Codex,
     Claude,
     Cursor,
+    Bifrost,
 }
 
 pub const ALL: [Prov; 3] = [Prov::Codex, Prov::Claude, Prov::Cursor];
+pub const DISPLAY: [Prov; 4] = [Prov::Codex, Prov::Claude, Prov::Cursor, Prov::Bifrost];
 pub const MAC: bool = cfg!(target_os = "macos");
 const KEYCHAIN: &str = "Claude Code-credentials";
 const BETA: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
@@ -25,7 +32,35 @@ pub struct Win {
     pub reset: Option<f64>,
 }
 
+/// Dollar accounting stays separate from subscription usage percentages.
+pub struct Spend {
+    pub used: Option<f64>,
+    pub cap: Option<f64>,
+    pub currency: Option<String>,
+    pub period: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl Spend {
+    pub fn unknown(reason: &str) -> Self {
+        Self { used: None, cap: None, currency: None, period: None, reason: Some(reason.into()) }
+    }
+
+    pub fn summary(&self) -> String {
+        match (self.used, self.cap) {
+            (Some(used), Some(cap)) => format!("{} {used:.4} / {cap:.2}{}", self.currency.as_deref().unwrap_or("?"), self.period.as_ref().map(|p| format!(" · {p}")).unwrap_or_default()),
+            (Some(used), None) => format!("{} {used:.4} · cap unknown{}", self.currency.as_deref().unwrap_or("?"), self.period.as_ref().map(|p| format!(" · {p}")).unwrap_or_default()),
+            _ => format!("n/a · {}", self.reason.as_deref().unwrap_or("not reported")),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        json!({"used": self.used, "cap": self.cap, "currency": self.currency, "period": self.period, "reason": self.reason})
+    }
+}
+
 pub struct Usage {
+    pub spend: Spend,
     pub plan: Option<String>,
     pub windows: Vec<Win>,
     pub resets: Option<i64>,
@@ -82,6 +117,7 @@ impl Prov {
             Prov::Codex => "codex",
             Prov::Claude => "claude",
             Prov::Cursor => "cursor",
+            Prov::Bifrost => "bifrost",
         }
     }
 
@@ -92,6 +128,7 @@ impl Prov {
     /// The live credential, or the one a login left in `dir`.
     pub fn read(self, dir: Option<&Path>) -> Option<Value> {
         match self {
+            Prov::Bifrost => None,
             Prov::Cursor => {
                 let cred = rjson(&cursor_auth(dir))?;
                 cred["accessToken"].as_str()?;
@@ -123,6 +160,7 @@ impl Prov {
     pub fn write(self, blob: &Value) -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
         match self {
+            Prov::Bifrost => Err("Bifrost is read-only".into()),
             Prov::Cursor => wjson(&cursor_auth(None), &blob["credentials"]).map_err(io),
             Prov::Codex => wjson(&codex_home().join("auth.json"), blob).map_err(io),
             Prov::Claude => {
@@ -149,6 +187,7 @@ impl Prov {
 
     pub fn email(self, blob: &Value) -> Option<String> {
         match self {
+            Prov::Bifrost => None,
             Prov::Cursor => blob["credentials"]["accessToken"]
                 .as_str()
                 .and_then(jwt)
@@ -161,6 +200,7 @@ impl Prov {
 
     pub fn expires(self, blob: &Value) -> Option<f64> {
         match self {
+            Prov::Bifrost => None,
             Prov::Cursor => jwt(blob["credentials"]["accessToken"].as_str()?)?["exp"].as_f64(),
             Prov::Codex => jwt(blob["tokens"]["access_token"].as_str()?)?["exp"].as_f64(),
             Prov::Claude => blob["credentials"]["claudeAiOauth"]["expiresAt"].as_f64().map(|ms| ms / 1000.0),
@@ -170,6 +210,7 @@ impl Prov {
     /// Run the real CLI's login, into `dir` when given.
     pub fn login(self, email: Option<&str>, dir: Option<&Path>) -> bool {
         let mut c = match self {
+            Prov::Bifrost => return false,
             Prov::Cursor => {
                 let mut c = cursor_command(dir);
                 c.arg("login");
@@ -197,7 +238,7 @@ impl Prov {
                 Prov::Claude => {
                     c.env("CLAUDE_CONFIG_DIR", d);
                 }
-                Prov::Cursor => {}
+                Prov::Cursor | Prov::Bifrost => {}
             }
         }
         c.status().is_ok_and(|s| s.success())
@@ -205,80 +246,12 @@ impl Prov {
 
     pub fn usage(self, blob: &Value) -> Result<Usage, String> {
         match self {
-            Prov::Cursor => Ok(Usage { plan: None, windows: vec![], resets: None, extra: Some("usage n/a".into()), limited: false }),
-            Prov::Codex => codex_usage(blob),
-            Prov::Claude => claude_usage(blob),
+            Prov::Cursor => cursor::usage(blob),
+            Prov::Bifrost => bifrost::usage(),
+            Prov::Codex => codex::usage(blob),
+            Prov::Claude => claude::usage(blob),
         }
     }
-}
-
-fn codex_usage(blob: &Value) -> Result<Usage, String> {
-    let t = &blob["tokens"];
-    let token = t["access_token"].as_str().ok_or("no access token")?;
-    let u = get(
-        "https://chatgpt.com/backend-api/wham/usage",
-        &[("Authorization", &format!("Bearer {token}")), ("ChatGPT-Account-Id", t["account_id"].as_str().unwrap_or(""))],
-    )?;
-    let rl = &u["rate_limit"];
-    let windows = ["primary_window", "secondary_window"]
-        .iter()
-        .map(|k| &rl[*k])
-        .filter(|w| w.is_object())
-        .map(|w| Win {
-            label: span(w["limit_window_seconds"].as_f64()),
-            pct: w["used_percent"].as_f64(),
-            reset: w["reset_at"].as_f64(),
-        })
-        .collect();
-    let cr = &u["credits"];
-    let extra = if cr["unlimited"].as_bool() == Some(true) {
-        Some("credits ∞".to_string())
-    } else if cr["has_credits"].as_bool() == Some(true) {
-        let bal = cr["balance"].as_f64().or_else(|| cr["balance"].as_str()?.parse().ok());
-        Some(format!("credits {:.0}", bal.unwrap_or(0.0)))
-    } else {
-        None
-    };
-    Ok(Usage {
-        plan: u["plan_type"].as_str().map(String::from),
-        windows,
-        resets: u["rate_limit_reset_credits"]["available_count"].as_i64(),
-        extra,
-        limited: rl["limit_reached"].as_bool() == Some(true),
-    })
-}
-
-fn claude_usage(blob: &Value) -> Result<Usage, String> {
-    let o = &blob["credentials"]["claudeAiOauth"];
-    let token = o["accessToken"].as_str().ok_or("no access token")?;
-    let u = get("https://api.anthropic.com/api/oauth/usage", &[("Authorization", &format!("Bearer {token}")), BETA])?;
-    let windows: Vec<Win> = [("five_hour", "5h"), ("seven_day", "7d")]
-        .iter()
-        .filter(|(k, _)| u[*k].is_object())
-        .map(|(k, label)| Win {
-            label: label.to_string(),
-            pct: u[*k]["utilization"].as_f64(),
-            reset: u[*k]["resets_at"].as_str().and_then(iso),
-        })
-        .collect();
-    let x = &u["extra_usage"];
-    let extra = (x["is_enabled"].as_bool() == Some(true)).then(|| {
-        format!(
-            "extra {:.0}/{:.0} {}",
-            x["used_credits"].as_f64().unwrap_or(0.0),
-            x["monthly_limit"].as_f64().unwrap_or(0.0),
-            x["currency"].as_str().unwrap_or("")
-        )
-        .trim_end()
-        .to_string()
-    });
-    let tier = o["rateLimitTier"].as_str().unwrap_or("");
-    let mut plan = o["subscriptionType"].as_str().unwrap_or("?").to_string();
-    if let Some(m) = ["20x", "5x"].iter().find(|m| tier.ends_with(*m)) {
-        plan = format!("{plan} {m}");
-    }
-    let limited = windows.iter().any(|w| w.pct.unwrap_or(0.0) >= 100.0);
-    Ok(Usage { plan: Some(plan), windows, resets: None, extra, limited })
 }
 
 fn keychain() -> Option<Value> {
@@ -417,9 +390,9 @@ mod tests {
         let opaque = json!({"credentials": {"accessToken": "opaque"}, "account": {"email": "saved@example.com"}});
         assert_eq!(Prov::Cursor.email(&opaque).as_deref(), Some("saved@example.com"));
         assert_eq!(Prov::Cursor.expires(&opaque), None);
-        let usage = Prov::Cursor.usage(&opaque).unwrap();
+        let usage = cursor::parse(&json!({}), &json!({}));
         assert!(usage.windows.is_empty());
-        assert_eq!(usage.extra.as_deref(), Some("usage n/a"));
+        assert!(usage.spend.used.is_none());
         assert!(!usage.limited);
     }
 

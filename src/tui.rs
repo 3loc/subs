@@ -224,6 +224,11 @@ impl App {
             _ => {}
         }
         let Some((p, email, active)) = self.cur() else { return };
+        if p == Prov::Bifrost { return; }
+        if email.is_empty() {
+            if k.code == KeyCode::Char('l') { self.login = Some((p, None)); }
+            return;
+        }
         match k.code {
             KeyCode::Enter if active => self.say(Ok(format!("{email} is already the active {} login", p.name()))),
             KeyCode::Enter => {
@@ -612,9 +617,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bifrost_actions_cannot_change_credentials() {
+        let row = Row { prov: Prov::Bifrost, email: crate::prov::bifrost::KEY.into(), active: false, password: false, usage: Err("unavailable".into()) };
+        let mut app = App { rows: vec![row], ..App::default() };
+        for key in [KeyCode::Enter, KeyCode::Char('l'), KeyCode::Char('f'), KeyCode::Char('a'), KeyCode::Char('p'), KeyCode::Char('d')] {
+            app.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(app.modal.is_none());
+            assert!(app.login.is_none());
+            assert!(app.push.is_none());
+        }
+    }
+
+    #[test]
     fn provider_picker_reaches_cursor_and_wraps_in_both_directions() {
-        let mut app = App::default();
-        app.modal = Some(Modal::Pick { idx: 0 });
+        let mut app = App { modal: Some(Modal::Pick { idx: 0 }), ..App::default() };
         for (key, expected) in [(KeyCode::Right, 1), (KeyCode::Tab, 2), (KeyCode::Right, 0), (KeyCode::BackTab, 2), (KeyCode::Left, 1)] {
             app.modal_key(KeyEvent::new(key, KeyModifiers::NONE));
             assert!(matches!(app.modal, Some(Modal::Pick { idx }) if idx == expected));

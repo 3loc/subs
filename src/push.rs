@@ -83,6 +83,7 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
     // Read what the host has first: a newer token for the same login stays,
     // since pushing an older copy over it can undo a refresh it already did.
     let read = match p {
+        Prov::Bifrost => return Done::Failed("Bifrost is read-only".into()),
         Prov::Cursor => {
             r#"if [ "$(uname -s)" = Darwin ]; then cat "$HOME/.cursor/auth.json"; else cat "$HOME/.config/cursor/auth.json"; fi 2>/dev/null; true"#
         }
@@ -95,6 +96,7 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
     };
     let (cred, state) = have.split_once(SPLIT).unwrap_or((&have, ""));
     let theirs = serde_json::from_str::<Value>(cred).ok().map(|c| match p {
+        Prov::Bifrost => Value::Null,
         Prov::Codex => c,
         Prov::Cursor => json!({"credentials": c}),
         Prov::Claude => {
@@ -107,6 +109,7 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
             return Done::Ok("has a newer token, kept".into());
         }
         _ => match p {
+            Prov::Bifrost => unreachable!("read-only provider"),
             Prov::Codex => codex_script(blob),
             Prov::Claude => claude_script(blob, state),
             Prov::Cursor => cursor_script(blob),
