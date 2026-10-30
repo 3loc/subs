@@ -1,6 +1,6 @@
 # subs
 
-See and switch ChatGPT/Codex and Claude subscription logins: who is active,
+See and switch ChatGPT/Codex, Claude, and Cursor subscription logins: who is active,
 usage, time to reset, banked full resets. Switching a login also installs it on
 all your machines.
 
@@ -8,7 +8,7 @@ all your machines.
 
 ## Install
 
-Needs Rust (`cargo`), `curl`, and the `codex` and/or `claude` CLI. Linux or macOS.
+Needs Rust (`cargo`), `curl`, and the `codex`, `claude`, and/or `cursor-agent` CLI. Linux or macOS.
 
 ```sh
 git clone git@github.com:3loc/subs.git && cd subs && make install
@@ -20,16 +20,16 @@ Installs to `~/.local/bin/subs` (`make install PREFIX=/usr/local` for system-wid
 ## Use
 
 ```sh
-subs                              # status of every account
-subs tui                          # interactive view
-subs login codex|claude [EMAIL]   # sign in; --use makes it active and pushes it
-                                  # (signing in as the active account always does)
-subs use codex|claude EMAIL       # make a saved login active and push it to your hosts
-subs push codex|claude            # push the active login to your hosts again
-subs add codex|claude EMAIL       # store the account's password
-subs pass codex|claude EMAIL      # copy (or print) that password
-subs json                         # status as JSON
-subs rm codex|claude EMAIL        # forget an account
+subs                                    # status of every account
+subs tui                                # interactive view
+subs login codex|claude|cursor [EMAIL]  # sign in; --use makes it active and pushes it
+                                        # (signing in as the active account always does)
+subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
+subs push codex|claude|cursor           # push the active login to your hosts again
+subs add codex|claude|cursor EMAIL      # store the account's password
+subs pass codex|claude|cursor EMAIL     # copy (or print) that password
+subs json                               # status as JSON
+subs rm codex|claude|cursor EMAIL       # forget an account
 ```
 
 ![subs](docs/status.gif)
@@ -56,3 +56,10 @@ machine.
 
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.
+
+Cursor uses `cursor-agent login`, isolated via `XDG_CONFIG_HOME` on Linux or
+`HOME` on macOS. Auth lives in `~/.config/cursor/auth.json` on Linux
+(`$XDG_CONFIG_HOME/cursor/auth.json` when set), or `~/.cursor/auth.json` on
+macOS. Email comes from JWT claims or `cursor-agent status --format json`;
+JWT expiry is checked when available. Cursor usage currently shows `usage n/a`.
+Push writes the default auth path on each host without stopping processes.

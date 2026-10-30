@@ -1,12 +1,13 @@
-//! subs - see and switch ChatGPT/Codex and Claude subscription logins.
+//! subs - see and switch ChatGPT/Codex, Claude, and Cursor subscription logins.
 //!
 //! State lives in $SUBS_HOME (default ${XDG_DATA_HOME:-~/.local/share}/subs), mode 0700:
 //!
 //!     accounts.json        {provider: {email: {"password": ...}}}
 //!     codex/EMAIL.json     a saved ~/.codex/auth.json
 //!     claude/EMAIL.json    a saved Claude credential + oauthAccount
+//!     cursor/EMAIL.json    a saved Cursor credential + account email
 //!
-//! Logins run in a throwaway CODEX_HOME / CLAUDE_CONFIG_DIR, so signing in to
+//! Logins run in a throwaway provider config directory (Cursor: XDG/HOME), so signing in to
 //! a new account never touches - or revokes - the one in use. `use` swaps the
 //! saved credential in, saving the current one first. Tokens are never
 //! refreshed here: a refresh rotates the token and kills every other copy, so
@@ -30,16 +31,16 @@ use std::time::Duration;
 const HELP: &str = "\
 usage: subs [command]
 
-  subs                              status of every account
-  subs tui                          interactive view
-  subs login codex|claude [EMAIL]   sign in; --use also makes it active
-  subs use   codex|claude EMAIL     make a saved login the active one and push
-                                    it to your hosts (--local: just this machine)
-  subs push  codex|claude           push the active login to your hosts again
-  subs add   codex|claude EMAIL     store the account's password
-  subs pass  codex|claude EMAIL     copy (or print) that password
-  subs rm    codex|claude EMAIL     forget an account
-  subs json                         status as JSON
+  subs                                    status of every account
+  subs tui                                interactive view
+  subs login codex|claude|cursor [EMAIL]  sign in; --use also makes it active
+  subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
+                                          it to your hosts (--local: just this machine)
+  subs push  codex|claude|cursor          push the active login to your hosts again
+  subs add   codex|claude|cursor EMAIL    store the account's password
+  subs pass  codex|claude|cursor EMAIL    copy (or print) that password
+  subs rm    codex|claude|cursor EMAIL    forget an account
+  subs json                               status as JSON
 
 Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
 the providers it takes (\"laptop claude\"). Offline hosts are skipped.";
@@ -111,7 +112,7 @@ fn main() {
     }
     let args: Vec<&str> = argv[1..].iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
     let Some(p) = args.first().and_then(|a| Prov::parse(a)) else {
-        die(format!("usage: subs {cmd} codex|claude EMAIL (subs help)"))
+        die(format!("usage: subs {cmd} codex|claude|cursor EMAIL (subs help)"))
     };
     let email = args.get(1).copied();
     let flag = |f: &str| argv.iter().any(|a| a == f);

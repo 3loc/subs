@@ -272,9 +272,10 @@ impl App {
         let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
         match self.modal.as_mut() {
             Some(Modal::Pick { idx }) => match k.code {
-                KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') => *idx = 0,
-                KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') => *idx = 1,
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Char(' ') => *idx = 1 - *idx,
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') => *idx = (*idx + ALL.len() - 1) % ALL.len(),
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') => *idx = (*idx + 1) % ALL.len(),
+                KeyCode::BackTab => *idx = (*idx + ALL.len() - 1) % ALL.len(),
+                KeyCode::Tab | KeyCode::Char(' ') => *idx = (*idx + 1) % ALL.len(),
                 _ => {}
             },
             Some(Modal::Input { value, .. }) => match k.code {
@@ -604,4 +605,19 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_picker_reaches_cursor_and_wraps_in_both_directions() {
+        let mut app = App::default();
+        app.modal = Some(Modal::Pick { idx: 0 });
+        for (key, expected) in [(KeyCode::Right, 1), (KeyCode::Tab, 2), (KeyCode::Right, 0), (KeyCode::BackTab, 2), (KeyCode::Left, 1)] {
+            app.modal_key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(matches!(app.modal, Some(Modal::Pick { idx }) if idx == expected));
+        }
+    }
 }

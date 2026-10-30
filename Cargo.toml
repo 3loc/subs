@@ -2,7 +2,7 @@
 name = "subs"
 version = "0.2.0"
 edition = "2021"
-description = "See and switch ChatGPT/Codex and Claude subscription logins"
+description = "See and switch ChatGPT/Codex, Claude, and Cursor subscription logins"
 repository = "https://github.com/3loc/subs"
 
 [dependencies]
