@@ -57,6 +57,82 @@ machine.
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.
 
+## Claude setup-token
+
+Use a long-lived subscription token when copying the normal OAuth login means
+frequent reauthentication. Generate it yourself using Claude's browser flow:
+
+```sh
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+claude setup-token
+subs login claude --token
+```
+
+Paste the generated token at the hidden prompt and press Enter. The token is
+never accepted as a command argument. For a raw token already in a private
+file outside a repository, use stdin instead:
+
+```sh
+chmod 600 /absolute/path/to/private-token
+subs login claude --token < /absolute/path/to/private-token
+```
+
+This installs `~/.config/subs/claude.env` atomically with mode 0600. If
+`XDG_CONFIG_HOME` is set, the path is `$XDG_CONFIG_HOME/subs/claude.env`.
+The file exports `CLAUDE_CODE_OAUTH_TOKEN` and unsets `ANTHROPIC_API_KEY`.
+It is never saved in an account snapshot. Symlinks, loose permissions, and
+storage inside a Git checkout are refused when loading it. Reinstalling
+replaces the old token; do not edit the generated env file.
+
+An idempotent hook sources the environment from `.profile`, `.bashrc`, and
+`.zshrc` (under `ZDOTDIR` when set), plus existing `.bash_profile`/`.bash_login`.
+It refuses to source the token if its permissions become unsafe. Open a new
+shell, or load it into the current shell, then push using your existing hosts:
+
+```sh
+. "${XDG_CONFIG_HOME:-$HOME/.config}/subs/claude-shell.sh"
+subs status
+subs json
+subs push claude
+```
+
+`subs login claude --token --use` combines installation and push; `--local`
+suppresses the push. Token pushes use the same SSH transport and host list as
+OAuth pushes. They preserve the original installation timestamp and leave
+Claude's account JSON and settings alone. On each VM, open a fresh interactive
+shell or source the same hook explicitly (also do this in noninteractive jobs):
+
+```sh
+. "${XDG_CONFIG_HOME:-$HOME/.config}/subs/claude-shell.sh"
+test "${ANTHROPIC_API_KEY+x}" != x && echo 'API key unset'
+test -n "${CLAUDE_CODE_OAUTH_TOKEN:+present}" && echo 'subscription token present'
+claude
+```
+
+Use `/status` inside Claude to inspect the authentication method. Restart existing
+Claude sessions; `subs` cannot change the environment of an already-running shell
+or process. Keep the managed hook after any custom credential exports.
+
+Status/TUI show token presence, permission/format failures, and estimated expiry.
+JSON adds `setup_token` metadata to the token row (or the first Claude row when
+absent). `valid` and `expires_at` remain null; `state` is `unverified` for a
+usable local file, and `estimated_expires_at` is installation time plus 365 days.
+This is an estimate, not verification: importing an older token or reinstalling
+the same token can overestimate its remaining life. Remote pushes preserve the
+estimate. The account identity and usage of a setup-token remain unknown.
+
+[Claude's documentation](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)
+describes these as one-year subscription tokens that can only make model requests.
+`subs` does not make a billable request to validate one. They do not provide
+Remote Control or claude.ai connectors, and Claude's `--bare` mode ignores them.
+
+Normal `subs login claude` still saves an OAuth login in isolation. While a
+setup-token is installed, it stays selected until you explicitly activate OAuth
+with `subs use claude EMAIL` or `subs login claude --use`. That removes the managed
+token locally and on pushed hosts; source the hook again or open new shells.
+Claude login subprocesses strip both inherited token and API key variables;
+`subs` warns when `ANTHROPIC_API_KEY` is present without printing its value.
+
 Cursor uses `cursor-agent login`, isolated via `XDG_CONFIG_HOME` on Linux or
 `HOME` on macOS. Auth lives in `~/.config/cursor/auth.json` on Linux
 (`$XDG_CONFIG_HOME/cursor/auth.json` when set), or `~/.cursor/auth.json` on

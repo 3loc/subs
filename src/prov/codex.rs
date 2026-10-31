@@ -5,7 +5,10 @@ pub(super) fn usage(blob: &Value) -> Result<Usage, String> {
     let token = t["access_token"].as_str().ok_or("no access token")?;
     let u = get(
         "https://chatgpt.com/backend-api/wham/usage",
-        &[("Authorization", &format!("Bearer {token}")), ("ChatGPT-Account-Id", t["account_id"].as_str().unwrap_or(""))],
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("ChatGPT-Account-Id", t["account_id"].as_str().unwrap_or("")),
+        ],
     )?;
     parse(&u)
 }
@@ -26,8 +29,13 @@ fn parse(u: &Value) -> Result<Usage, String> {
     let extra = if cr["unlimited"].as_bool() == Some(true) {
         Some("credits ∞".to_string())
     } else if cr["has_credits"].as_bool() == Some(true) {
-        let bal = cr["balance"].as_f64().or_else(|| cr["balance"].as_str()?.parse().ok());
-        Some(bal.map(|b| format!("credits {b:.0}")).unwrap_or_else(|| "credits unknown".into()))
+        let bal = cr["balance"]
+            .as_f64()
+            .or_else(|| cr["balance"].as_str()?.parse().ok());
+        Some(
+            bal.map(|b| format!("credits {b:.0}"))
+                .unwrap_or_else(|| "credits unknown".into()),
+        )
     } else {
         None
     };
@@ -55,7 +63,8 @@ mod tests {
     }
     #[test]
     fn missing_usage_is_not_zero() {
-        let u = parse(&json!({"rate_limit":{"primary_window":{}}, "credits":{"has_credits":true}})).unwrap();
+        let u = parse(&json!({"rate_limit":{"primary_window":{}}, "credits":{"has_credits":true}}))
+            .unwrap();
         assert_eq!(u.windows[0].pct, None);
         assert_eq!(u.extra.as_deref(), Some("credits unknown"));
         assert!(u.plan.is_none());

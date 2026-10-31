@@ -3,7 +3,7 @@ BIN = target/release/subs
 
 all: $(BIN)
 
-$(BIN): Cargo.toml Cargo.lock $(wildcard src/*.rs)
+$(BIN): Cargo.toml Cargo.lock $(wildcard src/*.rs src/prov/*.rs)
 	cargo build --release --locked
 
 install: $(BIN)

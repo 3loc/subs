@@ -67,12 +67,17 @@ pub fn body(rows: &[Row], sel: Option<usize>, cols: usize) -> Body {
         let top = lines.len();
         let name = p.name();
         lines.push(Line::from(vec![
-            span(format!("  {name} "), Style::new().add_modifier(Modifier::BOLD)),
+            span(
+                format!("  {name} "),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
             muted("─".repeat(cw.saturating_sub(name.len() + 3))),
         ]));
         let mine: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].prov == p).collect();
         if mine.is_empty() {
-            lines.push(Line::from(vec![muted(format!("    no accounts · n to sign in, or subs login {name}"))]));
+            lines.push(Line::from(vec![muted(format!(
+                "    no accounts · n to sign in, or subs login {name}"
+            ))]));
         }
         for (n, i) in mine.into_iter().enumerate() {
             if n > 0 {
@@ -87,24 +92,65 @@ pub fn body(rows: &[Row], sel: Option<usize>, cols: usize) -> Body {
 }
 
 fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
-    let edge = if selected { span("▎", fg(ACCENT)) } else { span(" ", Style::new()) };
-    let dot = if r.active { span("●", fg(Color::Green)) } else { muted("○") };
+    let edge = if selected {
+        span("▎", fg(ACCENT))
+    } else {
+        span(" ", Style::new())
+    };
+    let dot = if r.active {
+        span("●", fg(Color::Green))
+    } else {
+        muted("○")
+    };
     let meta = meta(r);
     let room = cw.saturating_sub(4 + width(&meta) + 2).max(8);
-    let email = trunc(if r.email.is_empty() { "no login" } else { &r.email }, room);
-    let style = if selected { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+    let email = trunc(
+        if r.email.is_empty() && r.token.as_ref().is_some_and(|t| t["present"] == true) {
+            "setup-token"
+        } else if r.email.is_empty() {
+            "no login"
+        } else {
+            &r.email
+        },
+        room,
+    );
+    let style = if selected {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
     let pad = cw.saturating_sub(4 + email.chars().count() + width(&meta));
-    let mut head = vec![edge.clone(), span(" ", Style::new()), dot, span(" ", Style::new()), span(email, style)];
+    let mut head = vec![
+        edge.clone(),
+        span(" ", Style::new()),
+        dot,
+        span(" ", Style::new()),
+        span(email, style),
+    ];
     head.push(span(" ".repeat(pad), Style::new()));
     head.extend(meta);
     let mut out = vec![Line::from(head)];
     match &r.usage {
-        Err(e) => out.push(Line::from(vec![edge, span(format!("   spend n/a · {e}"), fg(Color::Red))])),
-        Ok(u) if u.windows.is_empty() => out.push(Line::from(vec![edge, muted("   no usage reported")])),
+        Err(e) => out.push(Line::from(vec![
+            edge,
+            span(format!("   spend n/a · {e}"), fg(Color::Red)),
+        ])),
+        Ok(u) if u.windows.is_empty() => {
+            out.push(Line::from(vec![edge, muted("   no usage reported")]))
+        }
         Ok(u) => out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw))),
     }
+    if let Some(t) = &r.token {
+        out.push(Line::from(vec![muted(format!(
+            "    {}",
+            crate::prov::claude::health_summary(t)
+        ))]));
+    }
     if let Ok(u) = &r.usage {
-        out.push(Line::from(vec![muted(format!("    spend {}", u.spend.summary()))]));
+        out.push(Line::from(vec![muted(format!(
+            "    spend {}",
+            u.spend.summary()
+        ))]));
     }
     out
 }
@@ -114,7 +160,10 @@ fn meta(r: &Row) -> Vec<Span<'static>> {
     let Ok(u) = &r.usage else { return vec![] };
     let mut parts: Vec<Vec<Span<'static>>> = vec![];
     if u.limited {
-        parts.push(vec![span("used up", fg(Color::Red).add_modifier(Modifier::BOLD))]);
+        parts.push(vec![span(
+            "used up",
+            fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]);
     }
     if let Some(x) = &u.extra {
         parts.push(vec![muted(x.clone())]);
@@ -122,8 +171,15 @@ fn meta(r: &Row) -> Vec<Span<'static>> {
     match u.resets {
         Some(0) => parts.push(vec![muted("no full resets")]),
         Some(n) => parts.push(vec![
-            span(n.to_string(), fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            muted(if n == 1 { " full reset left" } else { " full resets left" }),
+            span(
+                n.to_string(),
+                fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            muted(if n == 1 {
+                " full reset left"
+            } else {
+                " full resets left"
+            }),
         ]),
         None => {}
     }
@@ -148,7 +204,11 @@ fn window(edge: Span<'static>, w: &Win, bw: usize) -> Line<'static> {
         "30d" => "monthly",
         l => l,
     };
-    let mut l = vec![edge, span("   ", Style::new()), muted(format!("{label:<8}"))];
+    let mut l = vec![
+        edge,
+        span("   ", Style::new()),
+        muted(format!("{label:<8}")),
+    ];
     // The bar is a fuel gauge: what is still left, on a track of what is used.
     match w.pct.map(|used| 100.0 - used.clamp(0.0, 100.0)) {
         Some(left) => {
@@ -160,8 +220,15 @@ fn window(edge: Span<'static>, w: &Win, bw: usize) -> Line<'static> {
                 l.push(span("╾", fg(c)));
             }
             l.push(muted("─".repeat(bw - full - half as usize)));
-            let bold = if left <= 10.0 { Modifier::BOLD } else { Modifier::empty() };
-            l.push(span(format!("{:>5}", format!("{left:.0}%")), fg(c).add_modifier(bold)));
+            let bold = if left <= 10.0 {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
+            l.push(span(
+                format!("{:>5}", format!("{left:.0}%")),
+                fg(c).add_modifier(bold),
+            ));
             l.push(muted(" left"));
         }
         None => {
@@ -169,7 +236,10 @@ fn window(edge: Span<'static>, w: &Win, bw: usize) -> Line<'static> {
             l.push(muted("    – left"));
         }
     }
-    let reset = w.reset.map(|t| format!("resets in {}", until(t))).unwrap_or_default();
+    let reset = w
+        .reset
+        .map(|t| format!("resets in {}", until(t)))
+        .unwrap_or_default();
     l.push(muted(format!("{reset:>19}")));
     Line::from(l)
 }

@@ -20,7 +20,11 @@ fn running(name: &str) -> usize {
     Command::new("pgrep")
         .args(["-x", name])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().count())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .count()
+        })
         .unwrap_or(0)
 }
 
@@ -41,13 +45,16 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
     let live = p.read(None);
     let cur = live.as_ref().and_then(|b| p.email(b));
     let same = cur.as_deref() == Some(email);
-    if same && !force {
+    if same && !force && !(p == Prov::Claude && crate::prov::claude::token_configured()) {
         return Ok(format!("{name}: {email} is already active"));
     }
     if let (Some(c), Some(l), false) = (&cur, &live, same) {
         wjson(&snap_path(p, c), l).map_err(io)?;
     }
     p.write(&blob)?;
+    if p == Prov::Claude {
+        crate::prov::claude::install_env(None)?;
+    }
     let mut msg = if same {
         format!("{name}: {email} signed in again")
     } else {
@@ -55,13 +62,24 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
     };
     match running(name) {
         0 => {}
-        n => msg += &format!(" · restart {n} {name} session{}", if n == 1 { "" } else { "s" }),
+        n => {
+            msg += &format!(
+                " · restart {n} {name} session{}",
+                if n == 1 { "" } else { "s" }
+            )
+        }
+    }
+    if p == Prov::Claude {
+        msg += " · open a new shell or source claude-shell.sh";
     }
     Ok(msg)
 }
 
 pub fn password(p: Prov, email: &str) -> Option<String> {
-    store::accounts()[p.name()][email]["password"].as_str().filter(|s| !s.is_empty()).map(String::from)
+    store::accounts()[p.name()][email]["password"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 pub fn store_password(p: Prov, email: &str, pw: &str) -> Result<(), String> {
@@ -88,7 +106,9 @@ pub fn add(p: Prov, email: &str) -> Res {
 pub fn show_password(p: Prov, email: &str) -> Res {
     let name = p.name();
     match password(p, email) {
-        None => Err(format!("{name}: no password stored for {email} (subs add {name} {email})")),
+        None => Err(format!(
+            "{name}: no password stored for {email} (subs add {name} {email})"
+        )),
         Some(pw) if clip(&pw) => Ok(format!("{name}: password for {email} copied to clipboard")),
         Some(pw) => Ok(format!("{name}: password for {email}: {pw}")),
     }
@@ -117,16 +137,20 @@ pub struct Login {
 pub fn login(p: Prov, email: Option<&str>, use_it: bool) -> Result<Login, String> {
     let name = p.name();
     // A stored password goes on the clipboard, ready for the browser.
-    if let Some(m) = email.filter(|e| password(p, e).is_some()).and_then(|e| show_password(p, e).ok()) {
+    if let Some(m) = email
+        .filter(|e| password(p, e).is_some())
+        .and_then(|e| show_password(p, e).ok())
+    {
         println!("{m}");
     }
     let dir = store::root().join(name);
     store::mkdir(&dir).map_err(io)?;
     for ent in fs::read_dir(&dir).map_err(io)?.flatten() {
         // left behind by a login that was killed hard
-        let stale = ent.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
-            t.elapsed().unwrap_or_default() > Duration::from_secs(3600)
-        });
+        let stale = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(3600));
         if stale && ent.file_name().to_string_lossy().starts_with(".login-") {
             let _ = fs::remove_dir_all(ent.path());
         }
@@ -134,7 +158,11 @@ pub fn login(p: Prov, email: Option<&str>, use_it: bool) -> Result<Login, String
     // macOS keeps the default Claude login in the keychain under a name tied
     // to the config dir, so there it signs in in place and puts the old one back.
     let inplace = p == Prov::Claude && claude_keychain(None);
-    let tmp = if inplace { None } else { Some(store::mkdtemp(&dir, ".login-").map_err(io)?) };
+    let tmp = if inplace {
+        None
+    } else {
+        Some(store::mkdtemp(&dir, ".login-").map_err(io)?)
+    };
     let before = p.read(None);
     let ok = p.login(email, tmp.as_deref());
     let blob = p.read(tmp.as_deref());
@@ -146,22 +174,33 @@ pub fn login(p: Prov, email: Option<&str>, use_it: bool) -> Result<Login, String
         .and_then(|b| p.email(&b).map(|g| (b, g)))
         .ok_or_else(|| format!("{name} login failed"))?;
     if email.is_some_and(|e| e != got) {
-        println!("signed in as {got}, not {} · saved under {got}", email.unwrap_or_default());
+        println!(
+            "signed in as {got}, not {} · saved under {got}",
+            email.unwrap_or_default()
+        );
     }
     wjson(&snap_path(p, &got), &blob).map_err(io)?;
-    let again = before.as_ref().and_then(|b| p.email(b)).as_deref() == Some(got.as_str());
+    let again = !(p == Prov::Claude && crate::prov::claude::token_configured())
+        && before.as_ref().and_then(|b| p.email(b)).as_deref() == Some(got.as_str());
     let live = use_it || again;
     if inplace && !live {
         if let Some(b) = &before {
             p.write(b)?;
         }
     }
+    if live && inplace {
+        crate::prov::claude::install_env(None)?;
+    }
     let msg = match (live, inplace) {
         (false, _) => format!("{name}: saved {got}"),
         (true, true) => format!("{name}: {got} signed in and active"),
         (true, false) => activate(p, &got, true)?,
     };
-    Ok(Login { email: got, live, msg })
+    Ok(Login {
+        email: got,
+        live,
+        msg,
+    })
 }
 
 pub fn clip(text: &str) -> bool {
@@ -193,20 +232,25 @@ pub fn clip(text: &str) -> bool {
 }
 
 fn on_path(cmd: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }
 
 /// Read a line from the terminal without echo.
 pub fn read_secret(prompt: &str) -> String {
+    read_secret_checked(prompt).unwrap_or_default()
+}
+
+pub fn read_secret_checked(prompt: &str) -> Result<String, String> {
     eprint!("{prompt}");
     let _ = io::stderr().flush();
     let mut s = String::new();
-    if terminal::enable_raw_mode().is_err() {
-        let _ = io::stdin().lock().read_line(&mut s);
-        return s.trim_end().to_string();
-    }
+    terminal::enable_raw_mode()
+        .map_err(|_| "cannot disable terminal echo; refusing secret input")?;
     loop {
-        let Ok(Event::Key(k)) = event::read() else { continue };
+        let Ok(Event::Key(k)) = event::read() else {
+            continue;
+        };
         if k.kind != KeyEventKind::Press {
             continue;
         }
@@ -226,5 +270,5 @@ pub fn read_secret(prompt: &str) -> String {
     }
     let _ = terminal::disable_raw_mode();
     eprintln!();
-    s
+    Ok(s)
 }
