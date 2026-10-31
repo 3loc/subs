@@ -39,13 +39,15 @@ usage: subs [command]
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
                                           it to your hosts (--local: just this machine)
   subs push  codex|claude|cursor          push the active login to your hosts again
+                                          (--host H, repeatable: only those hosts)
   subs add   codex|claude|cursor EMAIL    store the account's password
   subs pass  codex|claude|cursor EMAIL    copy (or print) that password
   subs rm    codex|claude|cursor EMAIL    forget an account
   subs json                               status as JSON
 
 Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
-the providers it takes (\"laptop claude\"). Offline hosts are skipped.";
+the providers it takes (\"laptop claude\"). Offline hosts are skipped.
+--host H on push, use or login --use pushes only to H, which must be listed.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");
@@ -116,11 +118,25 @@ fn main() {
         }
         _ => {}
     }
-    let args: Vec<&str> = argv[1..]
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
+    // `--host H` / `--host=H` (repeatable) limits a push to those hosts.
+    let mut only: Vec<String> = vec![];
+    let mut args: Vec<&str> = vec![];
+    let mut rest = argv[1..].iter();
+    while let Some(a) = rest.next() {
+        if a == "--host" {
+            match rest.next() {
+                Some(h) if !h.starts_with('-') => only.push(h.clone()),
+                _ => die("usage: --host HOST (subs help)"),
+            }
+        } else if let Some(h) = a.strip_prefix("--host=") {
+            if h.is_empty() {
+                die("usage: --host HOST (subs help)");
+            }
+            only.push(h.to_string());
+        } else if !a.starts_with('-') {
+            args.push(a);
+        }
+    }
     let Some(p) = args.first().and_then(|a| Prov::parse(a)) else {
         die(format!(
             "usage: subs {cmd} codex|claude|cursor EMAIL (subs help)"
@@ -128,11 +144,14 @@ fn main() {
     };
     let email = args.get(1).copied();
     let flag = |f: &str| argv.iter().any(|a| a == f);
+    if !only.is_empty() && (flag("--local") || !matches!(cmd, "push" | "use" | "login")) {
+        die("--host only applies to a push: subs push|use|login ... --host HOST");
+    }
     let fan = |ok: bool| {
         if !ok || flag("--local") {
             return;
         }
-        if !push::cli(p) {
+        if !push::cli(p, &only) {
             exit(1)
         }
     };
