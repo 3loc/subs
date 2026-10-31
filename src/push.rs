@@ -87,6 +87,9 @@ pub fn start(p: Prov, hosts: &[String], blob: Value, tx: Sender<(usize, Done)>) 
 const SPLIT: &str = "\nSUBS_SPLIT\n";
 
 pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
+    if p == Prov::Cursor {
+        return crate::prov::cursor::push(host, blob);
+    }
     if p == Prov::Claude && blob["setup_token"] == true {
         return match claude::load_token() {
             Ok(Some(token)) => send_script(host, &(claude::env_script(Some(&token)) + "printf 'subs: subscription token installed; open a new shell and restart Claude\n'\n")),
@@ -98,9 +101,7 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
     // since pushing an older copy over it can undo a refresh it already did.
     let read = match p {
         Prov::Bifrost => return Done::Failed("Bifrost is read-only".into()),
-        Prov::Cursor => {
-            r#"if [ "$(uname -s)" = Darwin ]; then cat "$HOME/.cursor/auth.json"; else cat "$HOME/.config/cursor/auth.json"; fi 2>/dev/null; true"#
-        }
+        Prov::Cursor => unreachable!("Cursor handles its own push"),
         Prov::Codex => "cat \"$HOME/.codex/auth.json\" 2>/dev/null; true",
         Prov::Claude => "cat \"$HOME/.claude/.credentials.json\" 2>/dev/null; printf '\\nSUBS_SPLIT\\n'; cat \"$HOME/.claude.json\" 2>/dev/null; true",
     };
@@ -132,13 +133,13 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
             Prov::Bifrost => unreachable!("read-only provider"),
             Prov::Codex => codex_script(blob),
             Prov::Claude => claude_script(blob, state),
-            Prov::Cursor => cursor_script(blob),
+            Prov::Cursor => unreachable!("Cursor handles its own push"),
         },
     };
     send_script(host, &script)
 }
 
-fn send_script(host: &str, script: &str) -> Done {
+pub(crate) fn send_script(host: &str, script: &str) -> Done {
     match ssh(host, "sh -s", script) {
         Err(d) => d,
         Ok(out) => match out.lines().rev().find_map(|l| l.strip_prefix("subs: ")) {
@@ -155,9 +156,6 @@ fn send_script(host: &str, script: &str) -> Done {
 
 /// The host already has this login with a token at least as new as ours.
 fn keep_theirs(p: Prov, theirs: &Value, ours: &Value) -> bool {
-    if p == Prov::Cursor && (p.expires(theirs).is_none() || p.expires(ours).is_none()) {
-        return false;
-    }
     let workspace = |v: &Value| v["tokens"]["account_id"].clone();
     let same = p.email(theirs).is_some()
         && p.email(theirs) == p.email(ours)
@@ -165,7 +163,7 @@ fn keep_theirs(p: Prov, theirs: &Value, ours: &Value) -> bool {
     same && theirs != ours && p.expires(theirs) >= p.expires(ours)
 }
 
-fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
+pub(crate) fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
     let mut c = Command::new("ssh")
         .env_remove("ANTHROPIC_API_KEY")
         .args([
@@ -291,25 +289,6 @@ else
 fi
 "#,
         payload = heredoc("$t", &pretty(blob))
-    )
-}
-
-fn cursor_script(blob: &Value) -> String {
-    format!(
-        r#"set -eu
-umask 077
-if [ "$(uname -s)" = Darwin ]; then d="$HOME/.cursor"; else d="$HOME/.config/cursor"; fi
-mkdir -p "$d"
-t=$(mktemp "$d/.auth.json.subs.XXXXXX")
-trap 'rm -f "$t"' EXIT
-{payload}chmod 600 "$t"
-if [ -f "$d/auth.json" ] && cmp -s "$t" "$d/auth.json"; then
-  echo "subs: unchanged"; exit 0
-fi
-mv -f "$t" "$d/auth.json"
-echo "subs: updated"
-"#,
-        payload = heredoc("$t", &pretty(&blob["credentials"]))
     )
 }
 
@@ -556,66 +535,6 @@ mod tests {
         };
         let t = b64(format!(r#"{{"email":"{email}","exp":{exp}}}"#));
         json!({"tokens": {"id_token": format!("h.{t}.s"), "access_token": format!("h.{t}.s"), "account_id": ws}})
-    }
-
-    #[test]
-    fn cursor_keeps_only_identifiable_newer_tokens() {
-        let cursor = |email, exp| json!({"credentials": {"accessToken": codex(email, exp, "w")["tokens"]["access_token"]}});
-        assert!(keep_theirs(
-            Prov::Cursor,
-            &cursor("a@x", 200),
-            &cursor("a@x", 100)
-        ));
-        assert!(!keep_theirs(
-            Prov::Cursor,
-            &cursor("b@x", 200),
-            &cursor("a@x", 100)
-        ));
-        let opaque =
-            json!({"credentials": {"accessToken": "synthetic"}, "account": {"email": "a@x"}});
-        assert!(!keep_theirs(Prov::Cursor, &opaque, &cursor("a@x", 100)));
-    }
-
-    #[test]
-    fn cursor_script_installs_only_auth_atomically_and_is_idempotent() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = crate::store::mkdtemp(&std::env::temp_dir(), "subs-cursor-push-").unwrap();
-        let blob = json!({"credentials": {"accessToken": "synthetic", "refreshToken": "synthetic"}, "account": {"email": "a@x"}});
-        let script = cursor_script(&blob);
-        assert!(!script.contains("pkill"));
-        for expected in ["subs: updated", "subs: unchanged"] {
-            let mut child = Command::new("sh")
-                .arg("-s")
-                .env("HOME", &tmp)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(script.as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            assert!(out.status.success());
-            assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
-        }
-        let path = tmp.join(if crate::prov::MAC {
-            ".cursor/auth.json"
-        } else {
-            ".config/cursor/auth.json"
-        });
-        assert_eq!(crate::store::rjson(&path).unwrap(), blob["credentials"]);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
-        );
-        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
