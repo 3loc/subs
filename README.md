@@ -140,7 +140,14 @@ macOS. Email comes from JWT claims or `cursor-agent status --format json`;
 JWT expiry is checked when available. Plan and usage come from the same read-only DashboardService
 queries as `cursor-agent`’s `/usage`: included usage percentage and on-demand
 USD spend (converted from reported cents). Missing fields stay unknown.
-Push writes the default auth path on each host without stopping processes.
+All Cursor-specific login, credential, usage, and push code lives in
+`src/prov/cursor.rs`; the shared commands dispatch to it. No API key is needed.
+`cli-config.json` is configuration, not the login, and is not copied.
+Push respects the remote Linux `XDG_CONFIG_HOME`, writes auth atomically with
+mode 0600 in a 0700 parent directory, and keeps a newer token for the same
+account. It repairs permissions even when auth is unchanged, without stopping
+processes. If not signed in, run `NO_OPEN_BROWSER=1 cursor-agent login` and
+open the printed browser URL; then run `subs push cursor`.
 
 ## Spending
 

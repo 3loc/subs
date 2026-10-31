@@ -4,7 +4,7 @@
 pub mod bifrost;
 pub(crate) mod claude;
 mod codex;
-mod cursor;
+pub(crate) mod cursor;
 
 use crate::store::{env_path, home, rjson, wjson};
 use serde_json::{json, Value};
@@ -96,30 +96,6 @@ fn claude_cfg() -> PathBuf {
     env_path("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home().join(".claude"))
 }
 
-// Cursor auth ignores CURSOR_CONFIG_DIR. Linux uses XDG; macOS uses HOME.
-fn cursor_auth(dir: Option<&Path>) -> PathBuf {
-    if MAC {
-        dir.map(Path::to_path_buf)
-            .unwrap_or_else(home)
-            .join(".cursor/auth.json")
-    } else {
-        dir.map(Path::to_path_buf)
-            .or_else(|| env_path("XDG_CONFIG_HOME"))
-            .unwrap_or_else(|| home().join(".config"))
-            .join("cursor/auth.json")
-    }
-}
-
-fn cursor_command(dir: Option<&Path>) -> Command {
-    let mut c = Command::new("cursor-agent");
-    c.env_remove("CURSOR_API_KEY")
-        .env_remove("CURSOR_API_KEY_FILE");
-    if let Some(d) = dir {
-        c.env(if MAC { "HOME" } else { "XDG_CONFIG_HOME" }, d);
-    }
-    c
-}
-
 /// ~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json when that is set.
 fn claude_state(cfg: Option<&Path>) -> PathBuf {
     match cfg {
@@ -152,24 +128,7 @@ impl Prov {
     pub fn read(self, dir: Option<&Path>) -> Option<Value> {
         match self {
             Prov::Bifrost => None,
-            Prov::Cursor => {
-                let cred = rjson(&cursor_auth(dir))?;
-                cred["accessToken"].as_str()?;
-                let email = cred["accessToken"]
-                    .as_str()
-                    .and_then(jwt)
-                    .and_then(|v| v["email"].as_str().map(String::from))
-                    .or_else(|| {
-                        let out = cursor_command(dir)
-                            .args(["status", "--format", "json"])
-                            .stderr(Stdio::null())
-                            .output()
-                            .ok()?;
-                        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-                        v["userInfo"]["email"].as_str().map(String::from)
-                    });
-                Some(json!({"credentials": cred, "account": {"email": email}}))
-            }
+            Prov::Cursor => cursor::read(dir),
             Prov::Codex => rjson(
                 &dir.map(Path::to_path_buf)
                     .unwrap_or_else(codex_home)
@@ -205,7 +164,7 @@ impl Prov {
         let io = |e: std::io::Error| e.to_string();
         match self {
             Prov::Bifrost => Err("Bifrost is read-only".into()),
-            Prov::Cursor => wjson(&cursor_auth(None), &blob["credentials"]).map_err(io),
+            Prov::Cursor => cursor::write(blob),
             Prov::Codex => wjson(&codex_home().join("auth.json"), blob).map_err(io),
             Prov::Claude => {
                 if claude_keychain(None) {
@@ -247,11 +206,7 @@ impl Prov {
     pub fn email(self, blob: &Value) -> Option<String> {
         match self {
             Prov::Bifrost => None,
-            Prov::Cursor => blob["credentials"]["accessToken"]
-                .as_str()
-                .and_then(jwt)
-                .and_then(|v| v["email"].as_str().map(String::from))
-                .or_else(|| blob["account"]["email"].as_str().map(String::from)),
+            Prov::Cursor => cursor::email(blob),
             Prov::Codex => jwt(blob["tokens"]["id_token"].as_str()?)?["email"]
                 .as_str()
                 .map(String::from),
@@ -262,7 +217,7 @@ impl Prov {
     pub fn expires(self, blob: &Value) -> Option<f64> {
         match self {
             Prov::Bifrost => None,
-            Prov::Cursor => jwt(blob["credentials"]["accessToken"].as_str()?)?["exp"].as_f64(),
+            Prov::Cursor => cursor::expires(blob),
             Prov::Codex => jwt(blob["tokens"]["access_token"].as_str()?)?["exp"].as_f64(),
             Prov::Claude => blob["credentials"]["claudeAiOauth"]["expiresAt"]
                 .as_f64()
@@ -274,11 +229,7 @@ impl Prov {
     pub fn login(self, email: Option<&str>, dir: Option<&Path>) -> bool {
         let mut c = match self {
             Prov::Bifrost => return false,
-            Prov::Cursor => {
-                let mut c = cursor_command(dir);
-                c.arg("login");
-                c
-            }
+            Prov::Cursor => return cursor::login(dir),
             Prov::Codex => {
                 let mut c = Command::new("codex");
                 c.args([
@@ -463,52 +414,6 @@ fn days(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cursor_identity_expiry_and_usage() {
-        // Synthetic JWT: {"email":"a@b.c","exp":200}
-        let blob =
-            json!({"credentials": {"accessToken": "x.eyJlbWFpbCI6ImFAYi5jIiwiZXhwIjoyMDB9.y"}});
-        assert_eq!(Prov::parse("cursor"), Some(Prov::Cursor));
-        assert_eq!(Prov::Cursor.email(&blob).as_deref(), Some("a@b.c"));
-        assert_eq!(Prov::Cursor.expires(&blob), Some(200.0));
-        let opaque = json!({"credentials": {"accessToken": "opaque"}, "account": {"email": "saved@example.com"}});
-        assert_eq!(
-            Prov::Cursor.email(&opaque).as_deref(),
-            Some("saved@example.com")
-        );
-        assert_eq!(Prov::Cursor.expires(&opaque), None);
-        let usage = cursor::parse(&json!({}), &json!({}));
-        assert!(usage.windows.is_empty());
-        assert!(usage.spend.used.is_none());
-        assert!(!usage.limited);
-    }
-
-    #[test]
-    fn cursor_login_and_read_share_an_isolated_auth_path() {
-        let dir = Path::new("/tmp/subs-cursor-test");
-        assert_eq!(
-            cursor_auth(Some(dir)),
-            dir.join(if MAC {
-                ".cursor/auth.json"
-            } else {
-                "cursor/auth.json"
-            })
-        );
-        let cmd = cursor_command(Some(dir));
-        assert!(cmd
-            .get_envs()
-            .any(|(k, v)| k == if MAC { "HOME" } else { "XDG_CONFIG_HOME" }
-                && v == Some(dir.as_os_str())));
-        // Reading a JWT credential needs no CLI invocation or network request.
-        let tmp = crate::store::mkdtemp(&std::env::temp_dir(), "subs-cursor-read-").unwrap();
-        let cred = json!({"accessToken": "x.eyJlbWFpbCI6ImFAYi5jIiwiZXhwIjoyMDB9.y", "refreshToken": "synthetic"});
-        wjson(&cursor_auth(Some(&tmp)), &cred).unwrap();
-        let blob = Prov::Cursor.read(Some(&tmp)).unwrap();
-        assert_eq!(blob["credentials"], cred);
-        assert_eq!(Prov::Cursor.email(&blob).as_deref(), Some("a@b.c"));
-        std::fs::remove_dir_all(tmp).unwrap();
-    }
 
     #[test]
     fn iso_parses_offsets_and_fractions() {
