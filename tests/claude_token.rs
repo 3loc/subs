@@ -330,3 +330,47 @@ fn installer_refuses_symlinks_without_touching_the_target() {
         .file_type()
         .is_symlink());
 }
+
+#[test]
+fn host_flag_pushes_only_to_the_named_listed_host() {
+    let f = Fixture::new();
+    f.install();
+    fs::write(
+        f.0.join(".config/subs/hosts"),
+        "fake-vm claude\nother-vm\ncodex-only codex\n",
+    )
+    .unwrap();
+    // Record every host ssh is asked to reach; the host is the arg before the command.
+    f.stub(
+        "ssh",
+        r#"n=$#; i=0; for a do i=$((i + 1)); if [ "$i" -eq $((n - 1)) ]; then printf '%s\n' "$a" >> "$HOME/ssh-hosts"; fi; done
+cat >/dev/null; printf 'subs: unchanged\n'
+"#,
+    );
+    let reached = || fs::read_to_string(f.0.join("ssh-hosts")).unwrap_or_default();
+
+    let out = f.run(&["push", "claude", "--host", "other-vm"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("to 1 host"));
+    assert_eq!(reached().lines().collect::<Vec<_>>(), ["other-vm"]);
+
+    // Unlisted, or listed for another provider: refused before any ssh.
+    for h in ["stranger", "codex-only"] {
+        let out = f.run(&["push", "claude", &format!("--host={h}")], "");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("does not take claude logins"));
+    }
+    assert_eq!(reached().lines().count(), 1);
+
+    // --host is meaningless without a push.
+    assert!(!f
+        .run(&["rm", "claude", "a@x", "--host", "fake-vm"], "")
+        .status
+        .success());
+    assert!(!f.run(&["push", "claude", "--host"], "").status.success());
+    assert_eq!(reached().lines().count(), 1);
+}

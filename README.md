@@ -25,7 +25,7 @@ subs tui                                # interactive view
 subs login codex|claude|cursor [EMAIL]  # sign in; --use makes it active and pushes it
                                         # (signing in as the active account always does)
 subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
-subs push codex|claude|cursor           # push the active login to your hosts again
+subs push codex|claude|cursor           # push the active login to your hosts again (--host H: only H)
 subs add codex|claude|cursor EMAIL      # store the account's password
 subs pass codex|claude|cursor EMAIL     # copy (or print) that password
 subs json                               # status as JSON
@@ -53,6 +53,15 @@ laptop   claude
 Offline hosts are skipped and get it on the next push. A host that already has
 the same login with a newer token keeps it. `subs use --local` switches only this
 machine.
+
+To push to just some of them, name each with `--host` (repeatable). A named host
+must already be listed for that provider; anything else is refused before a
+credential leaves this machine:
+
+```
+subs push claude --host laptop
+subs use codex you@example.com --host desktop --host laptop
+```
 
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.

@@ -362,8 +362,37 @@ pub fn active(p: Prov) -> Result<Value, String> {
         .ok_or_else(|| format!("no live {} login to push", p.name()))
 }
 
-pub fn cli(p: Prov) -> bool {
-    let hosts = hosts(p);
+/// Narrow the hosts that take `p` to the `--host` selection (empty = all).
+/// A requested host must already be listed for `p` in the hosts file, so a
+/// typo or a stray ssh alias can never receive a credential.
+pub fn select(p: Prov, all: Vec<String>, only: &[String]) -> Result<Vec<String>, String> {
+    if only.is_empty() {
+        return Ok(all);
+    }
+    let mut out: Vec<String> = vec![];
+    for h in only {
+        if !all.iter().any(|a| a == h) {
+            return Err(format!(
+                "{h} does not take {} logins · list it in {}",
+                p.name(),
+                config().display()
+            ));
+        }
+        if !out.contains(h) {
+            out.push(h.clone());
+        }
+    }
+    Ok(out)
+}
+
+pub fn cli(p: Prov, only: &[String]) -> bool {
+    let hosts = match select(p, hosts(p), only) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("subs: {e}");
+            return false;
+        }
+    };
     if hosts.is_empty() {
         println!(
             "{}: no hosts to push to · list them in {}",
@@ -581,5 +610,22 @@ mod tests {
         assert_eq!(hosts(Prov::Codex), ["desktop"]);
         assert_eq!(hosts(Prov::Claude), ["desktop", "laptop"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn host_selection_only_narrows_the_listed_hosts() {
+        let all = || vec!["desktop".to_string(), "laptop".to_string()];
+        let s = |v: &[&str]| v.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert_eq!(select(Prov::Claude, all(), &[]).unwrap(), all());
+        assert_eq!(
+            select(Prov::Claude, all(), &s(&["laptop"])).unwrap(),
+            ["laptop"]
+        );
+        assert_eq!(
+            select(Prov::Claude, all(), &s(&["laptop", "desktop", "laptop"])).unwrap(),
+            ["laptop", "desktop"]
+        );
+        let e = select(Prov::Codex, all(), &s(&["laptop", "stranger"])).unwrap_err();
+        assert!(e.starts_with("stranger does not take codex logins"), "{e}");
     }
 }
