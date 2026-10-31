@@ -10,7 +10,7 @@
 //! credential in a heredoc, so it never shows up in `ps` and the host needs
 //! nothing but sh. A host that does not answer is offline, not failed.
 
-use crate::prov::Prov;
+use crate::prov::{claude, Prov};
 use crate::store::{env_path, home};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -31,7 +31,9 @@ pub enum Done {
 
 pub fn config() -> PathBuf {
     env_path("SUBS_HOSTS").unwrap_or_else(|| {
-        env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("subs/hosts")
+        env_path("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home().join(".config"))
+            .join("subs/hosts")
     })
 }
 
@@ -40,14 +42,19 @@ pub fn hosts(p: Prov) -> Vec<String> {
     if crate::demo::on() {
         return crate::demo::HOSTS.map(String::from).to_vec();
     }
-    let Ok(text) = std::fs::read_to_string(config()) else { return vec![] };
+    let Ok(text) = std::fs::read_to_string(config()) else {
+        return vec![];
+    };
     let me = local_names();
     let mut out: Vec<String> = vec![];
     for line in text.lines() {
         let mut words = line.split('#').next().unwrap_or("").split_whitespace();
         let Some(host) = words.next() else { continue };
         let only: Vec<&str> = words.collect();
-        if (only.is_empty() || only.contains(&p.name())) && !me.iter().any(|m| m == host) && !out.iter().any(|h| h == host) {
+        if (only.is_empty() || only.contains(&p.name()))
+            && !me.iter().any(|m| m == host)
+            && !out.iter().any(|h| h == host)
+        {
             out.push(host.to_string());
         }
     }
@@ -80,6 +87,13 @@ pub fn start(p: Prov, hosts: &[String], blob: Value, tx: Sender<(usize, Done)>) 
 const SPLIT: &str = "\nSUBS_SPLIT\n";
 
 pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
+    if p == Prov::Claude && blob["setup_token"] == true {
+        return match claude::load_token() {
+            Ok(Some(token)) => send_script(host, &(claude::env_script(Some(&token)) + "printf 'subs: subscription token installed; open a new shell and restart Claude\n'\n")),
+            Ok(None) => Done::Failed("Claude setup-token is no longer installed".into()),
+            Err(e) => Done::Failed(e),
+        };
+    }
     // Read what the host has first: a newer token for the same login stays,
     // since pushing an older copy over it can undo a refresh it already did.
     let read = match p {
@@ -100,13 +114,19 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
         Prov::Codex => c,
         Prov::Cursor => json!({"credentials": c}),
         Prov::Claude => {
-            let acct = serde_json::from_str::<Value>(state).map(|s| s["oauthAccount"].clone()).unwrap_or_default();
+            let acct = serde_json::from_str::<Value>(state)
+                .map(|s| s["oauthAccount"].clone())
+                .unwrap_or_default();
             json!({"credentials": c, "account": acct})
         }
     });
     let script = match theirs {
         Some(t) if keep_theirs(p, &t, blob) => {
-            return Done::Ok("has a newer token, kept".into());
+            if p != Prov::Claude {
+                return Done::Ok("has a newer token, kept".into());
+            }
+            claude::env_script(None)
+                + "printf 'subs: newer OAuth token kept; subscription environment installed\n'\n"
         }
         _ => match p {
             Prov::Bifrost => unreachable!("read-only provider"),
@@ -115,10 +135,19 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
             Prov::Cursor => cursor_script(blob),
         },
     };
-    match ssh(host, "sh -s", &script) {
+    send_script(host, &script)
+}
+
+fn send_script(host: &str, script: &str) -> Done {
+    match ssh(host, "sh -s", script) {
         Err(d) => d,
         Ok(out) => match out.lines().rev().find_map(|l| l.strip_prefix("subs: ")) {
-            Some(r) => Done::Ok(r.trim().to_string()),
+            // Only known status text is safe: a remote shell can echo the secret.
+            Some("unchanged") => Done::Ok("unchanged".into()),
+            Some("newer OAuth token kept; subscription environment installed") => {
+                Done::Ok("newer OAuth token kept; open a new shell".into())
+            }
+            Some(_) => Done::Ok("updated · open a new shell and restart sessions".into()),
             None => Done::Failed("no answer from the host's shell".into()),
         },
     }
@@ -138,13 +167,29 @@ fn keep_theirs(p: Prov, theirs: &Value, ours: &Value) -> bool {
 
 fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
     let mut c = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "-o", "RemoteCommand=none", "-T", host, cmd])
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=6",
+            "-o",
+            "RemoteCommand=none",
+            "-T",
+            "--",
+            host,
+            cmd,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Done::Failed(format!("ssh: {e}")))?;
-    let (mut stdin, mut so, mut se) = (c.stdin.take().unwrap(), c.stdout.take().unwrap(), c.stderr.take().unwrap());
+    let (mut stdin, mut so, mut se) = (
+        c.stdin.take().unwrap(),
+        c.stdout.take().unwrap(),
+        c.stderr.take().unwrap(),
+    );
     let input = input.to_string();
     let w = thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
@@ -174,25 +219,48 @@ fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
     let _ = w.join();
     let out = ro.join().unwrap_or_default();
     let err = re.join().unwrap_or_default();
-    let last = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    // Remote shells may echo stdin on failure. Never surface their credential-bearing output.
+    let last = if cmd == "sh -s" {
+        "remote credential installation failed".to_string()
+    } else {
+        err.lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
     match status {
         None => Err(Done::Failed("timed out".into())),
         Some(s) if s.code() == Some(255) => {
-            let down = ["timed out", "No route", "refused", "unreachable", "Network is down"];
+            let down = [
+                "timed out",
+                "No route",
+                "refused",
+                "unreachable",
+                "Network is down",
+            ];
             Err(if down.iter().any(|d| err.contains(d)) {
                 Done::Offline
             } else {
                 Done::Failed(last.trim_start_matches("ssh: ").to_string())
             })
         }
-        Some(s) if !s.success() => Err(Done::Failed(if last.is_empty() { format!("exit {}", s.code().unwrap_or(-1)) } else { last })),
+        Some(s) if !s.success() => Err(Done::Failed(if last.is_empty() {
+            format!("exit {}", s.code().unwrap_or(-1))
+        } else {
+            last
+        })),
         Some(_) => Ok(out),
     }
 }
 
 /// `cat > FILE` of `body`, under a delimiter the body cannot contain.
-fn heredoc(file: &str, body: &str) -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+pub(crate) fn heredoc(file: &str, body: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let delim = format!("SUBS_{nanos:x}");
     format!("cat > \"{file}\" <<'{delim}'\n{body}\n{delim}\n")
 }
@@ -248,7 +316,11 @@ echo "subs: updated"
 fn claude_script(blob: &Value, state: &str) -> String {
     // ~/.claude.json names the account; only rewrite it when that changes,
     // and never when it is there but unreadable.
-    let state = if state.trim().is_empty() { Some(json!({})) } else { serde_json::from_str::<Value>(state).ok() };
+    let state = if state.trim().is_empty() {
+        Some(json!({}))
+    } else {
+        serde_json::from_str::<Value>(state).ok()
+    };
     let merged = state.as_ref().filter(|s| s.is_object()).and_then(|s| {
         let mut m = s.clone();
         // Claude keeps its own richer copy of the account; only replace it
@@ -266,8 +338,10 @@ fn claude_script(blob: &Value, state: &str) -> String {
             heredoc("$s", &pretty(&m))
         ),
     };
+    let environment = claude::env_script(None);
     format!(
-        r#"set -eu
+        r#"{environment}
+set -eu
 umask 077
 mkdir -p "$HOME/.claude"
 s=
@@ -301,25 +375,55 @@ echo "subs: $r"
 
 /// Run a push from the command line, one line per host as they finish.
 /// False when a reachable host refused it.
+pub fn active(p: Prov) -> Result<Value, String> {
+    if p == Prov::Claude && claude::load_token()?.is_some() {
+        return Ok(json!({"setup_token": true}));
+    }
+    p.read(None)
+        .ok_or_else(|| format!("no live {} login to push", p.name()))
+}
+
 pub fn cli(p: Prov) -> bool {
     let hosts = hosts(p);
     if hosts.is_empty() {
-        println!("{}: no hosts to push to · list them in {}", p.name(), config().display());
+        println!(
+            "{}: no hosts to push to · list them in {}",
+            p.name(),
+            config().display()
+        );
         return true;
     }
     let blob = if crate::demo::on() {
         serde_json::json!({"demo": true})
     } else {
-        let Some(b) = p.read(None) else {
-            eprintln!("subs: no live {} login to push", p.name());
-            return false;
-        };
-        b
+        match active(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("subs: {e}");
+                return false;
+            }
+        }
     };
-    let email = if crate::demo::on() { crate::demo::ACTIVE.lock().unwrap().to_string() } else { p.email(&blob).unwrap_or_default() };
-    let color = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none();
-    let paint = |code: &str, s: &str| if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() };
-    println!("{}: pushing {email} to {} host{}", p.name(), hosts.len(), if hosts.len() == 1 { "" } else { "s" });
+    let email = if crate::demo::on() {
+        crate::demo::ACTIVE.lock().unwrap().to_string()
+    } else {
+        p.email(&blob).unwrap_or_default()
+    };
+    let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, s: &str| {
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+    println!(
+        "{}: pushing {email} to {} host{}",
+        p.name(),
+        hosts.len(),
+        if hosts.len() == 1 { "" } else { "s" }
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     start(p, &hosts, blob, tx);
     let w = hosts.iter().map(String::len).max().unwrap_or(0);
@@ -332,12 +436,23 @@ pub fn cli(p: Prov) -> bool {
     let mut got = 0;
     while got < hosts.len() {
         if live {
-            let names: Vec<&str> = hosts.iter().zip(&waiting).filter(|(_, w)| **w).map(|(h, _)| h.as_str()).collect();
+            let names: Vec<&str> = hosts
+                .iter()
+                .zip(&waiting)
+                .filter(|(_, w)| **w)
+                .map(|(h, _)| h.as_str())
+                .collect();
             let frame = spin[(started.elapsed().as_millis() / 80) as usize % spin.len()];
-            print!("\r\x1b[K  {} {}", paint("36", frame), paint("90", &format!("waiting for {}", names.join(", "))));
+            print!(
+                "\r\x1b[K  {} {}",
+                paint("36", frame),
+                paint("90", &format!("waiting for {}", names.join(", ")))
+            );
             let _ = std::io::stdout().flush();
         }
-        let Ok((i, d)) = rx.recv_timeout(Duration::from_millis(80)) else { continue };
+        let Ok((i, d)) = rx.recv_timeout(Duration::from_millis(80)) else {
+            continue;
+        };
         got += 1;
         waiting[i] = false;
         if live {
@@ -382,12 +497,57 @@ pub fn summary(ok: usize, off: usize, bad: usize, n: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn oauth_push_installs_credentials_and_clears_setup_token_environment() {
+        let tmp = crate::store::mkdtemp(&std::env::temp_dir(), "subs-claude-oauth-push-").unwrap();
+        let state =
+            json!({"theme": "dark", "oauthAccount": {"emailAddress": "old@example.invalid"}});
+        let blob = json!({"credentials": {"claudeAiOauth": {"accessToken": "FAKE-oauth", "expiresAt": 200}},
+            "account": {"emailAddress": "new@example.invalid"}});
+        crate::store::wjson(&tmp.join(".claude.json"), &state).unwrap();
+        let script = claude_script(&blob, &state.to_string());
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", &tmp)
+            .env("XDG_CONFIG_HOME", tmp.join(".config"))
+            .env_remove("ZDOTDIR")
+            .env_remove("ENV")
+            .env_remove("BASH_ENV")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(script.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "OAuth push installer failed");
+        assert_eq!(
+            crate::store::rjson(&tmp.join(".claude/.credentials.json")).unwrap(),
+            blob["credentials"]
+        );
+        let updated = crate::store::rjson(&tmp.join(".claude.json")).unwrap();
+        assert_eq!(updated["theme"], "dark");
+        assert_eq!(updated["oauthAccount"], blob["account"]);
+        let env = std::fs::read_to_string(tmp.join(".config/subs/claude.env")).unwrap();
+        assert!(env.contains("unset ANTHROPIC_API_KEY"));
+        assert!(env.contains("unset CLAUDE_CODE_OAUTH_TOKEN"));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     fn codex(email: &str, exp: u64, ws: &str) -> Value {
         let b64 = |j: String| {
             const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
             let (mut out, bytes) = (String::new(), j.into_bytes());
             for c in bytes.chunks(3) {
-                let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+                let n = c
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
                 for i in 0..=c.len() {
                     out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
                 }
@@ -401,9 +561,18 @@ mod tests {
     #[test]
     fn cursor_keeps_only_identifiable_newer_tokens() {
         let cursor = |email, exp| json!({"credentials": {"accessToken": codex(email, exp, "w")["tokens"]["access_token"]}});
-        assert!(keep_theirs(Prov::Cursor, &cursor("a@x", 200), &cursor("a@x", 100)));
-        assert!(!keep_theirs(Prov::Cursor, &cursor("b@x", 200), &cursor("a@x", 100)));
-        let opaque = json!({"credentials": {"accessToken": "synthetic"}, "account": {"email": "a@x"}});
+        assert!(keep_theirs(
+            Prov::Cursor,
+            &cursor("a@x", 200),
+            &cursor("a@x", 100)
+        ));
+        assert!(!keep_theirs(
+            Prov::Cursor,
+            &cursor("b@x", 200),
+            &cursor("a@x", 100)
+        ));
+        let opaque =
+            json!({"credentials": {"accessToken": "synthetic"}, "account": {"email": "a@x"}});
         assert!(!keep_theirs(Prov::Cursor, &opaque, &cursor("a@x", 100)));
     }
 
@@ -415,28 +584,68 @@ mod tests {
         let script = cursor_script(&blob);
         assert!(!script.contains("pkill"));
         for expected in ["subs: updated", "subs: unchanged"] {
-            let mut child = Command::new("sh").arg("-s").env("HOME", &tmp)
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
-            child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+            let mut child = Command::new("sh")
+                .arg("-s")
+                .env("HOME", &tmp)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
             let out = child.wait_with_output().unwrap();
             assert!(out.status.success());
             assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
         }
-        let path = tmp.join(if crate::prov::MAC { ".cursor/auth.json" } else { ".config/cursor/auth.json" });
+        let path = tmp.join(if crate::prov::MAC {
+            ".cursor/auth.json"
+        } else {
+            ".config/cursor/auth.json"
+        });
         assert_eq!(crate::store::rjson(&path).unwrap(), blob["credentials"]);
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
     fn newer_token_for_the_same_login_stays() {
         let p = Prov::Codex;
-        assert!(keep_theirs(p, &codex("a@x", 200, "w"), &codex("a@x", 100, "w")));
-        assert!(!keep_theirs(p, &codex("a@x", 100, "w"), &codex("a@x", 200, "w")));
-        assert!(!keep_theirs(p, &codex("b@x", 900, "w"), &codex("a@x", 100, "w")));
-        assert!(!keep_theirs(p, &codex("a@x", 900, "v"), &codex("a@x", 100, "w")));
-        assert!(!keep_theirs(p, &codex("a@x", 100, "w"), &codex("a@x", 100, "w")));
+        assert!(keep_theirs(
+            p,
+            &codex("a@x", 200, "w"),
+            &codex("a@x", 100, "w")
+        ));
+        assert!(!keep_theirs(
+            p,
+            &codex("a@x", 100, "w"),
+            &codex("a@x", 200, "w")
+        ));
+        assert!(!keep_theirs(
+            p,
+            &codex("b@x", 900, "w"),
+            &codex("a@x", 100, "w")
+        ));
+        assert!(!keep_theirs(
+            p,
+            &codex("a@x", 900, "v"),
+            &codex("a@x", 100, "w")
+        ));
+        assert!(!keep_theirs(
+            p,
+            &codex("a@x", 100, "w"),
+            &codex("a@x", 100, "w")
+        ));
     }
 
     #[test]
@@ -444,7 +653,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("subs-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("hosts");
-        std::fs::write(&f, "# fleet\ndesktop\nlaptop claude   # mac\n\nlocalhost\ndesktop\n").unwrap();
+        std::fs::write(
+            &f,
+            "# fleet\ndesktop\nlaptop claude   # mac\n\nlocalhost\ndesktop\n",
+        )
+        .unwrap();
         std::env::set_var("SUBS_HOSTS", &f);
         assert_eq!(hosts(Prov::Codex), ["desktop"]);
         assert_eq!(hosts(Prov::Claude), ["desktop", "laptop"]);

@@ -34,6 +34,8 @@ usage: subs [command]
   subs                                    status of every account
   subs tui                                interactive view
   subs login codex|claude|cursor [EMAIL]  sign in; --use also makes it active
+  subs login claude --token             install setup-token from hidden prompt or stdin
+                                          --use also pushes it to your hosts
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
                                           it to your hosts (--local: just this machine)
   subs push  codex|claude|cursor          push the active login to your hosts again
@@ -59,7 +61,10 @@ fn fetch() -> Vec<status::Row> {
     let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut i = 0;
     while !job.is_finished() {
-        eprint!("\r\x1b[36m{}\x1b[0m \x1b[90mfetching usage\x1b[0m", spin[i % spin.len()]);
+        eprint!(
+            "\r\x1b[36m{}\x1b[0m \x1b[90mfetching usage\x1b[0m",
+            spin[i % spin.len()]
+        );
         let _ = io::stderr().flush();
         std::thread::sleep(Duration::from_millis(80));
         i += 1;
@@ -88,6 +93,7 @@ fn report(r: actions::Res) {
 }
 
 fn main() {
+    prov::claude::warn_api_key();
     let root = store::root();
     if let Err(e) = store::mkdir(&root) {
         die(format!("{}: {e}", root.display()));
@@ -110,9 +116,15 @@ fn main() {
         }
         _ => {}
     }
-    let args: Vec<&str> = argv[1..].iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
+    let args: Vec<&str> = argv[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
     let Some(p) = args.first().and_then(|a| Prov::parse(a)) else {
-        die(format!("usage: subs {cmd} codex|claude|cursor EMAIL (subs help)"))
+        die(format!(
+            "usage: subs {cmd} codex|claude|cursor EMAIL (subs help)"
+        ))
     };
     let email = args.get(1).copied();
     let flag = |f: &str| argv.iter().any(|a| a == f);
@@ -124,12 +136,23 @@ fn main() {
             exit(1)
         }
     };
+    if flag("--token") {
+        if cmd != "login" || p != Prov::Claude || email.is_some() {
+            die("usage: subs login claude --token [--use] [--local]; token is read from stdin");
+        }
+        report(prov::claude::install_token());
+        return fan(flag("--use"));
+    }
     match cmd {
         "login" => {
             let l = actions::login(p, email, flag("--use")).unwrap_or_else(|e| die(e));
             println!("{}", l.msg);
             if !l.live {
-                println!("make it the active login with: subs use {} {}", p.name(), l.email);
+                println!(
+                    "make it the active login with: subs use {} {}",
+                    p.name(),
+                    l.email
+                );
             } else if !flag("--local") {
                 println!();
             }
@@ -138,7 +161,9 @@ fn main() {
         "push" => return fan(true),
         _ => {}
     }
-    let Some(email) = email else { die(format!("usage: subs {cmd} {} EMAIL", p.name())) };
+    let Some(email) = email else {
+        die(format!("usage: subs {cmd} {} EMAIL", p.name()))
+    };
     if cmd == "use" {
         let r = actions::use_(p, email);
         let switched = r.as_ref().is_ok_and(|m| !m.ends_with("is already active"));

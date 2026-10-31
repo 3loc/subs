@@ -6,8 +6,8 @@ use crate::push::{self, Done};
 use crate::status::{self, Row};
 use crate::view::{self, fg, muted, span, ACCENT, MAX, MUTED};
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, PopKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, PopKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::crossterm::{cursor, execute};
@@ -43,9 +43,24 @@ enum Then {
 }
 
 enum Modal {
-    Pick { idx: usize },
-    Input { title: String, prompt: String, value: String, secret: bool, then: Then },
-    Confirm { title: String, text: String, detail: String, verb: &'static str, danger: bool, then: Then },
+    Pick {
+        idx: usize,
+    },
+    Input {
+        title: String,
+        prompt: String,
+        value: String,
+        secret: bool,
+        then: Then,
+    },
+    Confirm {
+        title: String,
+        text: String,
+        detail: String,
+        verb: &'static str,
+        danger: bool,
+        then: Then,
+    },
 }
 
 /// A fan-out in flight: one slot per host, filled as each answers.
@@ -66,12 +81,24 @@ impl Push {
 
     fn counts(&self) -> (usize, usize, usize) {
         let count = |f: fn(&Done) -> bool| self.done.iter().flatten().filter(|d| f(d)).count();
-        (count(|d| matches!(d, Done::Ok(_))), count(|d| matches!(d, Done::Offline)), count(|d| matches!(d, Done::Failed(_))))
+        (
+            count(|d| matches!(d, Done::Ok(_))),
+            count(|d| matches!(d, Done::Offline)),
+            count(|d| matches!(d, Done::Failed(_))),
+        )
     }
 
     fn summary(&self) -> (String, bool) {
         let (ok, off, bad) = self.counts();
-        (format!("{} {} · {}", self.prov.name(), self.email, push::summary(ok, off, bad, self.hosts.len())), bad == 0)
+        (
+            format!(
+                "{} {} · {}",
+                self.prov.name(),
+                self.email,
+                push::summary(ok, off, bad, self.hosts.len())
+            ),
+            bad == 0,
+        )
     }
 }
 
@@ -119,8 +146,11 @@ impl App {
             Ok(rows) => {
                 let keep = self.rows.get(self.sel).map(|r| (r.prov, r.email.clone()));
                 self.rows = rows;
-                let at = keep.and_then(|(p, e)| self.rows.iter().position(|r| r.prov == p && r.email == e));
-                self.sel = at.unwrap_or(self.sel).min(self.rows.len().saturating_sub(1));
+                let at = keep
+                    .and_then(|(p, e)| self.rows.iter().position(|r| r.prov == p && r.email == e));
+                self.sel = at
+                    .unwrap_or(self.sel)
+                    .min(self.rows.len().saturating_sub(1));
                 self.updated = Some(Instant::now());
             }
         }
@@ -142,19 +172,36 @@ impl App {
     fn start_push(&mut self, p: Prov, note: String) {
         let hosts = push::hosts(p);
         if hosts.is_empty() {
-            return self.say(Ok(format!("{note} · no hosts to push to, list them in {}", push::config().display())));
+            return self.say(Ok(format!(
+                "{note} · no hosts to push to, list them in {}",
+                push::config().display()
+            )));
         }
         let (blob, email) = if crate::demo::on() {
-            (serde_json::Value::Null, crate::demo::ACTIVE.lock().unwrap().to_string())
+            (
+                serde_json::Value::Null,
+                crate::demo::ACTIVE.lock().unwrap().to_string(),
+            )
         } else {
-            let Some(blob) = p.read(None) else { return self.say(Err(format!("no live {} login to push", p.name()))) };
+            let blob = match push::active(p) {
+                Ok(b) => b,
+                Err(e) => return self.say(Err(e)),
+            };
             let email = p.email(&blob).unwrap_or_default();
             (blob, email)
         };
         let (tx, rx) = mpsc::channel();
         push::start(p, &hosts, blob, tx);
         let done = hosts.iter().map(|_| None).collect();
-        self.push = Some(Push { prov: p, email, note, hosts, done, rx, started: Instant::now() });
+        self.push = Some(Push {
+            prov: p,
+            email,
+            note,
+            hosts,
+            done,
+            rx,
+            started: Instant::now(),
+        });
     }
 
     /// Make `email` the live login here, then push it to the hosts.
@@ -178,7 +225,11 @@ impl App {
             self.start_push(p, l.msg);
         } else {
             let n = push::hosts(p).len();
-            let hosts = if n == 0 { String::new() } else { format!(" and {n} host{}", if n == 1 { "" } else { "s" }) };
+            let hosts = if n == 0 {
+                String::new()
+            } else {
+                format!(" and {n} host{}", if n == 1 { "" } else { "s" })
+            };
             self.modal = Some(Modal::Confirm {
                 title: "signed in".into(),
                 text: format!("Use {} for {} now?", l.email, p.name()),
@@ -192,17 +243,26 @@ impl App {
     }
 
     fn cur(&self) -> Option<(Prov, String, bool)> {
-        self.rows.get(self.sel).map(|r| (r.prov, r.email.clone(), r.active))
+        self.rows
+            .get(self.sel)
+            .map(|r| (r.prov, r.email.clone(), r.active))
     }
 
     fn key(&mut self, k: KeyEvent) {
         if let Some(p) = self.push.take() {
             let r = if p.finished() {
                 let (msg, ok) = p.summary();
-                if ok { Ok(msg) } else { Err(msg) }
+                if ok {
+                    Ok(msg)
+                } else {
+                    Err(msg)
+                }
             } else {
                 let left = p.done.iter().filter(|d| d.is_none()).count();
-                Ok(format!("still pushing to {left} host{} in the background", if left == 1 { "" } else { "s" }))
+                Ok(format!(
+                    "still pushing to {left} host{} in the background",
+                    if left == 1 { "" } else { "s" }
+                ))
             };
             return self.say(r);
         }
@@ -215,26 +275,44 @@ impl App {
             // Not Esc: a terminal answering a query can send a stray one.
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab if n > 0 => self.sel = (self.sel + 1) % n,
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab if n > 0 => self.sel = (self.sel + n - 1) % n,
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab if n > 0 => {
+                self.sel = (self.sel + 1) % n
+            }
+            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab if n > 0 => {
+                self.sel = (self.sel + n - 1) % n
+            }
             KeyCode::Char('g') | KeyCode::Home => self.sel = 0,
             KeyCode::Char('G') | KeyCode::End => self.sel = n.saturating_sub(1),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('n') => self.modal = Some(Modal::Pick { idx: 0 }),
             _ => {}
         }
-        let Some((p, email, active)) = self.cur() else { return };
-        if p == Prov::Bifrost { return; }
+        let Some((p, email, active)) = self.cur() else {
+            return;
+        };
+        if p == Prov::Bifrost {
+            return;
+        }
         if email.is_empty() {
-            if k.code == KeyCode::Char('l') { self.login = Some((p, None)); }
+            if k.code == KeyCode::Char('f') && p == Prov::Claude {
+                self.start_push(p, "claude: pushing the active login".into());
+            }
+            if k.code == KeyCode::Char('l') {
+                self.login = Some((p, None));
+            }
             return;
         }
         match k.code {
-            KeyCode::Enter if active => self.say(Ok(format!("{email} is already the active {} login", p.name()))),
+            KeyCode::Enter if active => self.say(Ok(format!(
+                "{email} is already the active {} login",
+                p.name()
+            ))),
             KeyCode::Enter => {
                 self.switch(p, &email);
             }
-            KeyCode::Char('f') => self.start_push(p, format!("{}: pushing the active login again", p.name())),
+            KeyCode::Char('f') => {
+                self.start_push(p, format!("{}: pushing the active login again", p.name()))
+            }
             KeyCode::Char('l') => self.login = Some((p, Some(email))),
             KeyCode::Char('a') => {
                 self.modal = Some(Modal::Input {
@@ -277,8 +355,12 @@ impl App {
         let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
         match self.modal.as_mut() {
             Some(Modal::Pick { idx }) => match k.code {
-                KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') => *idx = (*idx + ALL.len() - 1) % ALL.len(),
-                KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') => *idx = (*idx + 1) % ALL.len(),
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('h' | 'k') => {
+                    *idx = (*idx + ALL.len() - 1) % ALL.len()
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('l' | 'j') => {
+                    *idx = (*idx + 1) % ALL.len()
+                }
                 KeyCode::BackTab => *idx = (*idx + ALL.len() - 1) % ALL.len(),
                 KeyCode::Tab | KeyCode::Char(' ') => *idx = (*idx + 1) % ALL.len(),
                 _ => {}
@@ -320,11 +402,18 @@ impl App {
                 let email = value.trim().to_string();
                 self.login = Some((p, (!email.is_empty()).then_some(email)));
             }
-            Then::Password(_, _) if value.is_empty() => self.say(Err("empty password, nothing stored".into())),
+            Then::Password(_, _) if value.is_empty() => {
+                self.say(Err("empty password, nothing stored".into()))
+            }
             Then::Password(p, email) => {
-                let r = actions::store_password(p, &email, &value).map(|_| format!("password stored for {email}"));
+                let r = actions::store_password(p, &email, &value)
+                    .map(|_| format!("password stored for {email}"));
                 if r.is_ok() {
-                    for row in self.rows.iter_mut().filter(|r| r.prov == p && r.email == email) {
+                    for row in self
+                        .rows
+                        .iter_mut()
+                        .filter(|r| r.prov == p && r.email == email)
+                    {
                         row.password = true;
                     }
                 }
@@ -382,7 +471,10 @@ pub fn run() -> io::Result<()> {
         app.poll();
         if let Some((p, email)) = app.login.take() {
             leave()?;
-            let who = email.as_deref().map(|e| format!(" as {e}")).unwrap_or_default();
+            let who = email
+                .as_deref()
+                .map(|e| format!(" as {e}"))
+                .unwrap_or_default();
             println!("\n\x1b[1;36msubs\x1b[0m · signing in to {}{who}", p.name());
             println!("\x1b[90mfollow the link, finish in the browser; you come back here when it is done\x1b[0m\n");
             let r = actions::login(p, email.as_deref(), false);
@@ -425,12 +517,24 @@ fn ago(t: Instant) -> String {
 fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if area.width < 48 || area.height < 12 {
-        let msg = Paragraph::new(Line::from(muted("subs · make the window a little bigger")).centered());
-        f.render_widget(msg, area.inner(Margin { horizontal: 0, vertical: area.height / 2 }));
+        let msg =
+            Paragraph::new(Line::from(muted("subs · make the window a little bigger")).centered());
+        f.render_widget(
+            msg,
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: area.height / 2,
+            }),
+        );
         return;
     }
     let w = (area.width - 4).min(MAX as u16);
-    let col = Rect { x: area.x + (area.width - w) / 2, y: area.y + 1, width: w, height: area.height - 2 };
+    let col = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + 1,
+        width: w,
+        height: area.height - 2,
+    };
     let [head, _, body, _, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -444,12 +548,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     let mut title: Vec<Span> = vec![span("  subs", fg(ACCENT).add_modifier(Modifier::BOLD))];
     if !app.rows.is_empty() {
         let n = app.rows.len();
-        title.push(muted(format!("   {n} account{}", if n == 1 { "" } else { "s" })));
+        title.push(muted(format!(
+            "   {n} account{}",
+            if n == 1 { "" } else { "s" }
+        )));
     }
     f.render_widget(Paragraph::new(Line::from(title)), head);
     let state = match (&app.loading, app.updated) {
         (Some((_, t)), _) => Line::from(vec![
-            span(SPIN[(t.elapsed().as_millis() / 80) as usize % SPIN.len()], fg(ACCENT)),
+            span(
+                SPIN[(t.elapsed().as_millis() / 80) as usize % SPIN.len()],
+                fg(ACCENT),
+            ),
             muted(" fetching usage "),
         ]),
         (None, Some(t)) => Line::from(muted(format!("{} ", ago(t)))),
@@ -458,7 +568,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(state.right_aligned()), head);
 
     if app.rows.is_empty() && app.loading.is_some() && app.updated.is_none() {
-        f.render_widget(Paragraph::new(Line::from(muted("  reading accounts…"))), body);
+        f.render_widget(
+            Paragraph::new(Line::from(muted("  reading accounts…"))),
+            body,
+        );
     } else {
         let b = view::body(&app.rows, Some(app.sel), w as usize);
         let h = body.height as usize;
@@ -477,8 +590,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     let toast = app.toast.as_ref().filter(|t| t.2.elapsed() < TOAST);
     let footer = match toast {
         Some((msg, ok, _)) => {
-            let (icon, c) = if *ok { ("✓", Color::Green) } else { ("✗", Color::Red) };
-            Line::from(vec![span(format!("  {icon} "), fg(c).add_modifier(Modifier::BOLD)), span(msg.clone(), Style::new())])
+            let (icon, c) = if *ok {
+                ("✓", Color::Green)
+            } else {
+                ("✗", Color::Red)
+            };
+            Line::from(vec![
+                span(format!("  {icon} "), fg(c).add_modifier(Modifier::BOLD)),
+                span(msg.clone(), Style::new()),
+            ])
         }
         None => {
             let mut l = vec![span("  ", Style::new())];
@@ -507,17 +627,30 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn modal(f: &mut Frame, m: &Modal, area: Rect) {
     let w = 56.min(area.width - 4);
     let h = 8;
-    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
     let (title, color) = match m {
         Modal::Pick { .. } => ("new login", ACCENT),
         Modal::Input { title, .. } => (title.as_str(), ACCENT),
-        Modal::Confirm { title, danger, .. } => (title.as_str(), if *danger { Color::Red } else { ACCENT }),
+        Modal::Confirm { title, danger, .. } => {
+            (title.as_str(), if *danger { Color::Red } else { ACCENT })
+        }
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(color))
-        .title(Line::from(span(format!(" {title} "), fg(color).add_modifier(Modifier::BOLD))));
-    let inner = block.inner(r).inner(Margin { horizontal: 2, vertical: 1 });
+        .title(Line::from(span(
+            format!(" {title} "),
+            fg(color).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(r).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
     f.render_widget(Clear, r);
     f.render_widget(block, r);
     let hint = |s: &str| Line::from(muted(s.to_string()));
@@ -526,14 +659,35 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
             let mut opts = vec![];
             for (i, p) in ALL.iter().enumerate() {
                 let on = i == *idx;
-                opts.push(span(if on { "● " } else { "○ " }, fg(if on { ACCENT } else { MUTED })));
-                let st = if on { Style::new().add_modifier(Modifier::BOLD) } else { fg(MUTED) };
+                opts.push(span(
+                    if on { "● " } else { "○ " },
+                    fg(if on { ACCENT } else { MUTED }),
+                ));
+                let st = if on {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    fg(MUTED)
+                };
                 opts.push(span(format!("{:<10}", p.name()), st));
             }
-            vec![hint("provider"), Line::from(opts), Line::default(), hint("←/→ choose · enter next · esc cancel")]
+            vec![
+                hint("provider"),
+                Line::from(opts),
+                Line::default(),
+                hint("←/→ choose · enter next · esc cancel"),
+            ]
         }
-        Modal::Input { prompt, value, secret, .. } => {
-            let shown = if *secret { "•".repeat(value.chars().count()) } else { value.clone() };
+        Modal::Input {
+            prompt,
+            value,
+            secret,
+            ..
+        } => {
+            let shown = if *secret {
+                "•".repeat(value.chars().count())
+            } else {
+                value.clone()
+            };
             let room = (inner.width as usize).saturating_sub(3);
             let skip = shown.chars().count().saturating_sub(room);
             let shown: String = shown.chars().skip(skip).collect();
@@ -545,11 +699,16 @@ fn modal(f: &mut Frame, m: &Modal, area: Rect) {
                 hint("enter ok · esc cancel"),
             ]
         }
-        Modal::Confirm { text, detail, verb, .. } => vec![
+        Modal::Confirm {
+            text, detail, verb, ..
+        } => vec![
             Line::from(text.clone()),
             hint(detail),
             Line::default(),
-            Line::from(vec![span("y", Style::new().add_modifier(Modifier::BOLD)), muted(format!(" {verb} · any other key cancels"))]),
+            Line::from(vec![
+                span("y", Style::new().add_modifier(Modifier::BOLD)),
+                muted(format!(" {verb} · any other key cancels")),
+            ]),
         ],
     };
     f.render_widget(Paragraph::new(lines), inner);
@@ -559,19 +718,33 @@ fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
     let w = 64.min(area.width - 4);
     let notes = wrap(&p.note, w.saturating_sub(6) as usize).len() as u16;
     let h = (p.hosts.len() as u16 + 7 + notes).min(area.height - 2);
-    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let r = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
     let title = format!(" push {} · {} ", p.prov.name(), p.email);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(fg(ACCENT))
-        .title(Line::from(span(title, fg(ACCENT).add_modifier(Modifier::BOLD))));
-    let inner = block.inner(r).inner(Margin { horizontal: 2, vertical: 1 });
+        .title(Line::from(span(
+            title,
+            fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(r).inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
     f.render_widget(Clear, r);
     f.render_widget(block, r);
     let spin = SPIN[(p.started.elapsed().as_millis() / 80) as usize % SPIN.len()];
     let hw = p.hosts.iter().map(|h| h.chars().count()).max().unwrap_or(0) + 2;
     let room = (inner.width as usize).saturating_sub(hw + 2);
-    let mut lines: Vec<Line> = wrap(&p.note, inner.width as usize).into_iter().map(|l| Line::from(muted(l))).collect();
+    let mut lines: Vec<Line> = wrap(&p.note, inner.width as usize)
+        .into_iter()
+        .map(|l| Line::from(muted(l)))
+        .collect();
     lines.push(Line::default());
     for (host, d) in p.hosts.iter().zip(&p.done) {
         let (icon, ic, text, tc) = match d {
@@ -590,9 +763,15 @@ fn push_overlay(f: &mut Frame, p: &Push, area: Rect) {
     let n = p.done.iter().flatten().count();
     lines.push(if p.finished() {
         let (ok, off, bad) = p.counts();
-        Line::from(vec![muted(push::summary(ok, off, bad, p.hosts.len())), muted(" · any key closes")])
+        Line::from(vec![
+            muted(push::summary(ok, off, bad, p.hosts.len())),
+            muted(" · any key closes"),
+        ])
     } else {
-        Line::from(muted(format!("{n} of {} done · any key hides this, the push carries on", p.hosts.len())))
+        Line::from(muted(format!(
+            "{n} of {} done · any key hides this, the push carries on",
+            p.hosts.len()
+        )))
     });
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -618,9 +797,26 @@ mod tests {
 
     #[test]
     fn bifrost_actions_cannot_change_credentials() {
-        let row = Row { prov: Prov::Bifrost, email: crate::prov::bifrost::KEY.into(), active: false, password: false, usage: Err("unavailable".into()) };
-        let mut app = App { rows: vec![row], ..App::default() };
-        for key in [KeyCode::Enter, KeyCode::Char('l'), KeyCode::Char('f'), KeyCode::Char('a'), KeyCode::Char('p'), KeyCode::Char('d')] {
+        let row = Row {
+            prov: Prov::Bifrost,
+            email: crate::prov::bifrost::KEY.into(),
+            active: false,
+            password: false,
+            token: None,
+            usage: Err("unavailable".into()),
+        };
+        let mut app = App {
+            rows: vec![row],
+            ..App::default()
+        };
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char('l'),
+            KeyCode::Char('f'),
+            KeyCode::Char('a'),
+            KeyCode::Char('p'),
+            KeyCode::Char('d'),
+        ] {
             app.key(KeyEvent::new(key, KeyModifiers::NONE));
             assert!(app.modal.is_none());
             assert!(app.login.is_none());
@@ -630,8 +826,17 @@ mod tests {
 
     #[test]
     fn provider_picker_reaches_cursor_and_wraps_in_both_directions() {
-        let mut app = App { modal: Some(Modal::Pick { idx: 0 }), ..App::default() };
-        for (key, expected) in [(KeyCode::Right, 1), (KeyCode::Tab, 2), (KeyCode::Right, 0), (KeyCode::BackTab, 2), (KeyCode::Left, 1)] {
+        let mut app = App {
+            modal: Some(Modal::Pick { idx: 0 }),
+            ..App::default()
+        };
+        for (key, expected) in [
+            (KeyCode::Right, 1),
+            (KeyCode::Tab, 2),
+            (KeyCode::Right, 0),
+            (KeyCode::BackTab, 2),
+            (KeyCode::Left, 1),
+        ] {
             app.modal_key(KeyEvent::new(key, KeyModifiers::NONE));
             assert!(matches!(app.modal, Some(Modal::Pick { idx }) if idx == expected));
         }
