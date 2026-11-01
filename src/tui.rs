@@ -290,9 +290,6 @@ impl App {
         let Some((p, email, active)) = self.cur() else {
             return;
         };
-        if p == Prov::Bifrost {
-            return;
-        }
         if email.is_empty() {
             if k.code == KeyCode::Char('f') && p == Prov::Claude {
                 self.start_push(p, "claude: pushing the active login".into());
@@ -794,35 +791,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bifrost_actions_cannot_change_credentials() {
-        let row = Row {
-            prov: Prov::Bifrost,
-            email: crate::prov::bifrost::KEY.into(),
-            active: false,
-            password: false,
-            token: None,
-            usage: Err("unavailable".into()),
-        };
-        let mut app = App {
-            rows: vec![row],
-            ..App::default()
-        };
-        for key in [
-            KeyCode::Enter,
-            KeyCode::Char('l'),
-            KeyCode::Char('f'),
-            KeyCode::Char('a'),
-            KeyCode::Char('p'),
-            KeyCode::Char('d'),
-        ] {
-            app.key(KeyEvent::new(key, KeyModifiers::NONE));
-            assert!(app.modal.is_none());
-            assert!(app.login.is_none());
-            assert!(app.push.is_none());
-        }
-    }
 
     #[test]
     fn provider_picker_reaches_cursor_and_wraps_in_both_directions() {

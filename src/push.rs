@@ -100,7 +100,6 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
     // Read what the host has first: a newer token for the same login stays,
     // since pushing an older copy over it can undo a refresh it already did.
     let read = match p {
-        Prov::Bifrost => return Done::Failed("Bifrost is read-only".into()),
         Prov::Cursor => unreachable!("Cursor handles its own push"),
         Prov::Codex => "cat \"$HOME/.codex/auth.json\" 2>/dev/null; true",
         Prov::Claude => "cat \"$HOME/.claude/.credentials.json\" 2>/dev/null; printf '\\nSUBS_SPLIT\\n'; cat \"$HOME/.claude.json\" 2>/dev/null; true",
@@ -111,7 +110,6 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
     };
     let (cred, state) = have.split_once(SPLIT).unwrap_or((&have, ""));
     let theirs = serde_json::from_str::<Value>(cred).ok().map(|c| match p {
-        Prov::Bifrost => Value::Null,
         Prov::Codex => c,
         Prov::Cursor => json!({"credentials": c}),
         Prov::Claude => {
@@ -130,7 +128,6 @@ pub fn push(p: Prov, host: &str, blob: &Value) -> Done {
                 + "printf 'subs: newer OAuth token kept; subscription environment installed\n'\n"
         }
         _ => match p {
-            Prov::Bifrost => unreachable!("read-only provider"),
             Prov::Codex => codex_script(blob),
             Prov::Claude => claude_script(blob, state),
             Prov::Cursor => unreachable!("Cursor handles its own push"),

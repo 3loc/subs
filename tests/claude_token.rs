@@ -53,7 +53,6 @@ impl Fixture {
             .env("SUBS_HOME", self.0.join("state"))
             .env("CODEX_HOME", self.0.join(".codex"))
             .env("CLAUDE_CONFIG_DIR", self.0.join(".claude"))
-            .env("SUBS_BIFROST_SSM_HOST", "")
             .env("TEST_REMOTE_HOME", self.0.join("remote"))
             .env("ANTHROPIC_API_KEY", "FAKE-API-KEY-DO-NOT-PRINT")
             .current_dir(&self.0);

@@ -1,7 +1,6 @@
 //! Providers. Each reads and writes its live credential "blob", names the
 //! account in it, and asks the provider - not the token - for plan and usage.
 
-pub mod bifrost;
 pub(crate) mod claude;
 mod codex;
 pub(crate) mod cursor;
@@ -17,11 +16,9 @@ pub enum Prov {
     Codex,
     Claude,
     Cursor,
-    Bifrost,
 }
 
 pub const ALL: [Prov; 3] = [Prov::Codex, Prov::Claude, Prov::Cursor];
-pub const DISPLAY: [Prov; 4] = [Prov::Codex, Prov::Claude, Prov::Cursor, Prov::Bifrost];
 pub const MAC: bool = cfg!(target_os = "macos");
 const KEYCHAIN: &str = "Claude Code-credentials";
 const BETA: (&str, &str) = ("anthropic-beta", "oauth-2025-04-20");
@@ -116,7 +113,6 @@ impl Prov {
             Prov::Codex => "codex",
             Prov::Claude => "claude",
             Prov::Cursor => "cursor",
-            Prov::Bifrost => "bifrost",
         }
     }
 
@@ -127,7 +123,6 @@ impl Prov {
     /// The live credential, or the one a login left in `dir`.
     pub fn read(self, dir: Option<&Path>) -> Option<Value> {
         match self {
-            Prov::Bifrost => None,
             Prov::Cursor => cursor::read(dir),
             Prov::Codex => rjson(
                 &dir.map(Path::to_path_buf)
@@ -163,7 +158,6 @@ impl Prov {
     pub fn write(self, blob: &Value) -> Result<(), String> {
         let io = |e: std::io::Error| e.to_string();
         match self {
-            Prov::Bifrost => Err("Bifrost is read-only".into()),
             Prov::Cursor => cursor::write(blob),
             Prov::Codex => wjson(&codex_home().join("auth.json"), blob).map_err(io),
             Prov::Claude => {
@@ -205,7 +199,6 @@ impl Prov {
 
     pub fn email(self, blob: &Value) -> Option<String> {
         match self {
-            Prov::Bifrost => None,
             Prov::Cursor => cursor::email(blob),
             Prov::Codex => jwt(blob["tokens"]["id_token"].as_str()?)?["email"]
                 .as_str()
@@ -216,7 +209,6 @@ impl Prov {
 
     pub fn expires(self, blob: &Value) -> Option<f64> {
         match self {
-            Prov::Bifrost => None,
             Prov::Cursor => cursor::expires(blob),
             Prov::Codex => jwt(blob["tokens"]["access_token"].as_str()?)?["exp"].as_f64(),
             Prov::Claude => blob["credentials"]["claudeAiOauth"]["expiresAt"]
@@ -228,7 +220,6 @@ impl Prov {
     /// Run the real CLI's login, into `dir` when given.
     pub fn login(self, email: Option<&str>, dir: Option<&Path>) -> bool {
         let mut c = match self {
-            Prov::Bifrost => return false,
             Prov::Cursor => return cursor::login(dir),
             Prov::Codex => {
                 let mut c = Command::new("codex");
@@ -257,7 +248,7 @@ impl Prov {
                 Prov::Claude => {
                     c.env("CLAUDE_CONFIG_DIR", d);
                 }
-                Prov::Cursor | Prov::Bifrost => {}
+                Prov::Cursor => {}
             }
         }
         c.status().is_ok_and(|s| s.success())
@@ -266,7 +257,6 @@ impl Prov {
     pub fn usage(self, blob: &Value) -> Result<Usage, String> {
         match self {
             Prov::Cursor => cursor::usage(blob),
-            Prov::Bifrost => bifrost::usage(),
             Prov::Codex => codex::usage(blob),
             Prov::Claude => claude::usage(blob),
         }

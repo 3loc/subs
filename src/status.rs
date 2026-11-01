@@ -52,13 +52,6 @@ pub fn status() -> Vec<Row> {
             todo.push((p, email, active, password, blob));
         }
     }
-    todo.push((
-        Prov::Bifrost,
-        crate::prov::bifrost::KEY.into(),
-        false,
-        false,
-        Some(Value::Null),
-    ));
     let mut rows: Vec<Row> = thread::scope(|s| {
         let jobs: Vec<_> = todo
             .into_iter()
@@ -158,12 +151,12 @@ mod tests {
     #[test]
     fn unavailable_spend_is_null_with_reason() {
         let rows = [Row {
-            prov: Prov::Bifrost,
-            email: crate::prov::bifrost::KEY.into(),
+            prov: Prov::Codex,
+            email: "a@example.com".into(),
             active: false,
             password: false,
             token: None,
-            usage: Err("unavailable: virtual key not deployed or not visible".into()),
+            usage: Err("not logged in".into()),
         }];
         let v = to_json(&rows);
         assert!(v[0]["spend"]["used"].is_null());
@@ -172,6 +165,5 @@ mod tests {
             v[0]["spend"]["reason"],
             rows[0].usage.as_ref().err().unwrap().as_str()
         );
-        assert!(Prov::parse("bifrost").is_none());
     }
 }

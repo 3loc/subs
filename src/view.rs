@@ -4,7 +4,7 @@
 //! ▎ ● ana@example.com                          1 full reset left · prolite
 //! ▎   weekly  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━─  97% left   resets in 6d 19h
 
-use crate::prov::{Win, DISPLAY};
+use crate::prov::{Win, ALL};
 use crate::status::{until, Row};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -60,7 +60,7 @@ pub fn body(rows: &[Row], sel: Option<usize>, cols: usize) -> Body {
     let cw = bw + FIXED;
     let mut lines = vec![];
     let mut spans = vec![(0, 0); rows.len()];
-    for p in DISPLAY {
+    for p in ALL {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
