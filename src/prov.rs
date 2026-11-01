@@ -207,6 +207,17 @@ impl Prov {
         }
     }
 
+    /// False when the credential has been cleared (an empty access token),
+    /// as Claude does after a failed refresh. Such a login cannot refresh.
+    pub fn has_token(self, blob: &Value) -> bool {
+        let tok = match self {
+            Prov::Cursor => return true,
+            Prov::Codex => &blob["tokens"]["access_token"],
+            Prov::Claude => &blob["credentials"]["claudeAiOauth"]["accessToken"],
+        };
+        tok.as_str().is_some_and(|s| !s.is_empty())
+    }
+
     pub fn expires(self, blob: &Value) -> Option<f64> {
         match self {
             Prov::Cursor => cursor::expires(blob),

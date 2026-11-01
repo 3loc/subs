@@ -27,8 +27,11 @@ pub fn status() -> Vec<Row> {
     for p in ALL {
         let live = p.read(None);
         let cur = live.as_ref().and_then(|b| p.email(b));
+        // A cleared credential must not overwrite the saved copy.
         if let (Some(c), Some(b)) = (&cur, &live) {
-            let _ = wjson(&snap_path(p, c), b);
+            if p.has_token(b) {
+                let _ = wjson(&snap_path(p, c), b);
+            }
         }
         let mut emails: BTreeSet<String> = store::snaps(p).into_iter().collect();
         if let Some(m) = acc[p.name()].as_object() {
@@ -94,6 +97,11 @@ pub fn status() -> Vec<Row> {
 }
 
 fn fetch(p: Prov, blob: &Value, active: bool) -> Result<Usage, String> {
+    if !p.has_token(blob) {
+        return Err(
+            "signed out on this host · token cleared, cannot refresh · sign in again with l".into(),
+        );
+    }
     if p.expires(blob).is_some_and(|t| t < now()) {
         return Err(if active {
             format!(
@@ -148,6 +156,13 @@ pub fn to_json(rows: &[Row]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleared_claude_credential_is_signed_out_not_expired() {
+        let blob = json!({"credentials": {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}, "account": {"emailAddress": "a@example.com"}});
+        let e = fetch(Prov::Claude, &blob, false).err().unwrap();
+        assert!(e.starts_with("signed out on this host"), "{e}");
+        assert!(!Prov::Claude.has_token(&blob));
+    }
     #[test]
     fn unavailable_spend_is_null_with_reason() {
         let rows = [Row {
