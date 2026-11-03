@@ -73,14 +73,93 @@ fn local_names() -> Vec<String> {
 
 /// Push `blob` to every host in parallel; each result goes to `tx` as it lands.
 pub fn start(p: Prov, hosts: &[String], blob: Value, tx: Sender<(usize, Done)>) {
+    start_with_t3(p, hosts, blob, tx, false);
+}
+
+fn start_with_t3(
+    p: Prov,
+    hosts: &[String],
+    blob: Value,
+    tx: Sender<(usize, Done)>,
+    restart_t3: bool,
+) {
     if crate::demo::on() {
         return crate::demo::start(tx);
     }
     for (i, host) in hosts.iter().enumerate() {
         let (host, blob, tx) = (host.clone(), blob.clone(), tx.clone());
         thread::spawn(move || {
-            let _ = tx.send((i, push(p, &host, &blob)));
+            let mut result = push(p, &host, &blob);
+            if restart_t3 && p == Prov::Claude {
+                if let Done::Ok(message) = &mut result {
+                    result = match ssh(&host, "sh -s", &t3_script(false)) {
+                        Ok(out) => match t3_result(&out) {
+                            Ok(note) => Done::Ok(format!("{message} · {note}")),
+                            Err(e) => Done::Failed(format!("credentials installed; {e}")),
+                        },
+                        Err(_) => Done::Failed("credentials installed; T3 restart failed".into()),
+                    };
+                }
+            }
+            let _ = tx.send((i, result));
         });
+    }
+}
+
+/// Only the explicitly requested, already-active user service is restarted.
+/// The source is deferred until after fanout so T3 cannot kill its own push.
+fn t3_script(defer: bool) -> String {
+    let action = if defer {
+        r#"command -v systemd-run >/dev/null 2>&1 || exit 1
+systemd-run --user --quiet --collect --unit="subs-t3-restart-$$" --on-active=5s "$(command -v systemctl)" --user try-restart t3code.service >/dev/null 2>&1 || exit 1
+printf 'subs-t3: scheduled\n'
+"#
+    } else {
+        r#"systemctl --user restart t3code.service >/dev/null 2>&1 || exit 1
+systemctl --user is-active --quiet t3code.service || exit 1
+printf 'subs-t3: restarted\n'
+"#
+    };
+    format!(
+        r#"set -eu
+if ! command -v systemctl >/dev/null 2>&1; then
+  printf 'subs-t3: unavailable\n'; exit 0
+fi
+if ! systemctl --user is-active --quiet t3code.service 2>/dev/null; then
+  printf 'subs-t3: inactive\n'; exit 0
+fi
+{action}"#
+    )
+}
+
+fn t3_result(output: &str) -> Result<&'static str, &'static str> {
+    match output.lines().last() {
+        Some("subs-t3: restarted") => Ok("T3 restarted"),
+        Some("subs-t3: scheduled") => Ok("T3 restart scheduled in 5s; reconnect T3"),
+        Some("subs-t3: inactive") => Ok("T3 skipped (user service not active)"),
+        Some("subs-t3: unavailable") => Ok("T3 skipped (systemctl unavailable)"),
+        _ => Err("T3 restart not confirmed"),
+    }
+}
+
+fn restart_local_t3() -> bool {
+    if crate::demo::on() {
+        return true;
+    }
+    let result = Command::new("sh").arg("-c").arg(t3_script(true)).output();
+    let note = match result {
+        Ok(out) if out.status.success() => t3_result(&String::from_utf8_lossy(&out.stdout)),
+        _ => Err("T3 restart could not be scheduled"),
+    };
+    match note {
+        Ok(note) => {
+            println!("  local: {note}");
+            true
+        }
+        Err(e) => {
+            eprintln!("subs: local {e}");
+            false
+        }
     }
 }
 
@@ -359,7 +438,7 @@ pub fn active(p: Prov) -> Result<Value, String> {
         .ok_or_else(|| format!("no live {} login to push", p.name()))
 }
 
-pub fn cli(p: Prov) -> bool {
+pub fn cli(p: Prov, restart_t3: bool) -> bool {
     let hosts = hosts(p);
     if hosts.is_empty() {
         println!(
@@ -367,7 +446,7 @@ pub fn cli(p: Prov) -> bool {
             p.name(),
             config().display()
         );
-        return true;
+        return !restart_t3 || restart_local_t3();
     }
     let blob = if crate::demo::on() {
         serde_json::json!({"demo": true})
@@ -401,7 +480,7 @@ pub fn cli(p: Prov) -> bool {
         if hosts.len() == 1 { "" } else { "s" }
     );
     let (tx, rx) = std::sync::mpsc::channel();
-    start(p, &hosts, blob, tx);
+    start_with_t3(p, &hosts, blob, tx, restart_t3);
     let w = hosts.iter().map(String::len).max().unwrap_or(0);
     let (mut ok, mut off, mut bad) = (0, vec![], 0);
     // While hosts answer, one live line names who is still being waited on.
@@ -455,7 +534,16 @@ pub fn cli(p: Prov) -> bool {
     if !off.is_empty() {
         println!("offline hosts get it on the next: subs push {}", p.name());
     }
-    bad == 0
+    if restart_t3 {
+        // Do this even if one remote failed; only the source restarts here.
+        let local_ok = restart_local_t3();
+        bad == 0 && local_ok
+    } else {
+        if p == Prov::Claude {
+            println!("T3 keeps its environment until restarted · use --restart-t3 to restart active T3 user services");
+        }
+        bad == 0
+    }
 }
 
 pub fn summary(ok: usize, off: usize, bad: usize, n: usize) -> String {
@@ -472,6 +560,13 @@ pub fn summary(ok: usize, off: usize, bad: usize, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t3_output_is_allowlisted() {
+        assert_eq!(t3_result("subs-t3: restarted\n"), Ok("T3 restarted"));
+        assert!(t3_result("subs-t3: unexpected-secret").is_err());
+        assert!(t3_result("subs-t3: restarted\nunknown").is_err());
+    }
 
     #[test]
     fn oauth_push_installs_credentials_and_clears_setup_token_environment() {

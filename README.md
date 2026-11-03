@@ -54,6 +54,27 @@ Offline hosts are skipped and get it on the next push. A host that already has
 the same login with a newer token keeps it. `subs use --local` switches only this
 machine.
 
+T3 can retain a previous Claude token in its process environment. To restart
+active `t3code.service` systemd user services after installing Claude credentials:
+
+```sh
+subs use claude you@example.com --restart-t3
+subs push claude --restart-t3
+subs login claude you@example.com --use --restart-t3
+```
+
+This is opt-in because it interrupts active T3 runs. Remote services restart
+only after their credential installation succeeds; an inactive service stays
+inactive. The source machine schedules its restart five seconds after fanout
+finishes, so a push launched inside T3 can finish first. Output distinguishes
+restarted, scheduled, skipped, and failed restarts. A restart failure returns a
+nonzero exit status even when the credentials were installed. Hosts without
+systemd user services are skipped. This option is for CLI Claude fanout and
+cannot be combined with `--local`; normal pushes and the TUI do not restart T3.
+
+For setup-tokens, the T3 service must already source the managed
+`claude-shell.sh` hook at startup; restarting does not rewrite T3 configuration.
+
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.
 

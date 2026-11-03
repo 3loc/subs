@@ -45,7 +45,9 @@ usage: subs [command]
   subs json                               status as JSON
 
 Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
-the providers it takes (\"laptop claude\"). Offline hosts are skipped.";
+the providers it takes (\"laptop claude\"). Offline hosts are skipped.
+Claude fanout: --restart-t3 restarts active t3code user services after installation.
+The local restart is scheduled last. This interrupts active T3 runs.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");
@@ -128,11 +130,19 @@ fn main() {
     };
     let email = args.get(1).copied();
     let flag = |f: &str| argv.iter().any(|a| a == f);
+    if flag("--restart-t3")
+        && (p != Prov::Claude || !matches!(cmd, "push" | "use" | "login") || flag("--local"))
+    {
+        die("--restart-t3 requires Claude fanout (push, use, or login --use); cannot combine with --local");
+    }
+    if flag("--restart-t3") && cmd == "login" && !flag("--use") {
+        die("login --restart-t3 requires --use");
+    }
     let fan = |ok: bool| {
         if !ok || flag("--local") {
             return;
         }
-        if !push::cli(p) {
+        if !push::cli(p, flag("--restart-t3")) {
             exit(1)
         }
     };
@@ -171,7 +181,7 @@ fn main() {
         if switched && !flag("--local") {
             println!();
         }
-        return fan(switched);
+        return fan(switched || flag("--restart-t3"));
     }
     report(match cmd {
         "add" => actions::add(p, email),

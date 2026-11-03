@@ -245,6 +245,140 @@ HOME="$TEST_REMOTE_HOME" XDG_CONFIG_HOME="$TEST_REMOTE_HOME/.config" exec /bin/s
     assert!(!f.0.join("remote/.claude/.credentials.json").exists());
 }
 
+fn mock_t3(f: &Fixture) {
+    f.install();
+    f.hosts();
+    f.stub("ssh", "HOME=\"$TEST_REMOTE_HOME\" XDG_CONFIG_HOME=\"$TEST_REMOTE_HOME/.config\" exec /bin/sh -s\n");
+    f.stub(
+        "systemctl",
+        r#"
+printf '%s:%s\n' "$HOME" "$*" >> "$TEST_REMOTE_HOME/../t3-calls"
+case "$*" in
+  '--user is-active --quiet t3code.service') exit "${TEST_T3_INACTIVE:-0}" ;;
+  '--user restart t3code.service')
+    test -f "$HOME/.config/subs/claude.env"
+    exit "${TEST_T3_RESTART_FAIL:-0}" ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    f.stub(
+        "systemd-run",
+        r#"
+test -f "$TEST_REMOTE_HOME/.config/subs/claude.env"
+printf 'scheduled:%s\n' "$*" >> "$TEST_REMOTE_HOME/../t3-calls"
+"#,
+    );
+}
+
+#[test]
+fn t3_restart_is_opt_in_and_source_is_scheduled_after_remote_restart() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    assert!(f.run(&["push", "claude"], "").status.success());
+    let log = f.0.join("t3-calls");
+    assert!(!log.exists(), "normal pushes must not touch T3");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("T3 restarted"));
+    assert!(text.contains("T3 restart scheduled"));
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(
+        calls.find("--user restart t3code.service").unwrap() < calls.find("scheduled:").unwrap()
+    );
+    assert!(calls.contains("--on-active=5s"));
+    assert!(calls.contains("--user try-restart t3code.service"));
+}
+
+#[test]
+fn t3_restart_failure_is_reported_after_credentials_are_installed() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    f.stub(
+        "systemctl",
+        r#"
+case "$*" in
+  '--user is-active --quiet t3code.service') exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("credentials installed; T3 restart failed")
+    );
+    assert!(f.0.join("remote/.config/subs/claude.env").exists());
+}
+
+#[test]
+fn selecting_the_active_oauth_account_can_restart_t3_and_schedule_failures_are_errors() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    fs::create_dir_all(f.0.join("state/claude")).unwrap();
+    fs::write(f.0.join("state/claude/test@example.invalid.json"), serde_json::json!({
+        "account": {"emailAddress": "test@example.invalid"},
+        "credentials": {"claudeAiOauth": {"accessToken": "synthetic", "refreshToken": "synthetic-refresh"}}
+    }).to_string()).unwrap();
+    assert!(f
+        .run(&["use", "claude", "test@example.invalid", "--local"], "")
+        .status
+        .success());
+    let out = f.run(
+        &["use", "claude", "test@example.invalid", "--restart-t3"],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("T3 restarted"));
+    f.stub("systemd-run", "exit 1\n");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("local T3 restart could not be scheduled")
+    );
+}
+
+#[test]
+fn t3_restart_skips_inactive_services_and_failed_installations() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    f.stub("systemctl", "exit 3\n");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("T3 skipped"));
+    assert!(!f.0.join("t3-calls").exists());
+
+    mock_t3(&f);
+    f.stub("ssh", "cat >/dev/null; exit 3\n");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(!out.status.success());
+    let calls = fs::read_to_string(f.0.join("t3-calls")).unwrap_or_default();
+    assert!(!calls.contains("--user restart t3code.service"));
+}
+
+#[test]
+fn t3_restart_flag_rejects_other_providers_and_local_only_operations() {
+    let f = Fixture::new();
+    for args in [
+        vec!["push", "codex", "--restart-t3"],
+        vec!["use", "claude", "a@example.com", "--local", "--restart-t3"],
+        vec!["login", "claude", "--restart-t3"],
+    ] {
+        let out = f.run(&args, "");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--restart-t3"));
+    }
+}
+
 #[test]
 fn remote_failure_or_echo_cannot_leak_the_token() {
     let f = Fixture::new();
