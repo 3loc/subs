@@ -42,6 +42,9 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
     let name = p.name();
     let blob = rjson(&snap_path(p, email))
         .ok_or_else(|| format!("no saved {name} login for {email} · subs login {name} {email}"))?;
+    if !p.has_token(&blob) {
+        return Err(format!("sign in required · subs login {name} {email}"));
+    }
     let live = p.read(None);
     let cur = live.as_ref().and_then(|b| p.email(b));
     let same = cur.as_deref() == Some(email);
@@ -49,7 +52,9 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
         return Ok(format!("{name}: {email} is already active"));
     }
     if let (Some(c), Some(l), false) = (&cur, &live, same) {
-        wjson(&snap_path(p, c), l).map_err(io)?;
+        if p.has_token(l) {
+            wjson(&snap_path(p, c), l).map_err(io)?;
+        }
     }
     p.write(&blob)?;
     if p == Prov::Claude {

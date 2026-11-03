@@ -107,6 +107,58 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn switching_accounts_preserves_saved_credentials_when_live_login_was_cleared() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("state/claude")).unwrap();
+    fs::create_dir_all(f.0.join(".claude")).unwrap();
+    let blob = |email: &str, token: &str| {
+        serde_json::json!({
+            "account": {"emailAddress": email},
+            "credentials": {"claudeAiOauth": {"accessToken": token}}
+        })
+    };
+    let old = blob("old@example.com", "synthetic-old");
+    let new = blob("new@example.com", "synthetic-new");
+    let saved = f.0.join("state/claude/old@example.com.json");
+    fs::write(&saved, old.to_string()).unwrap();
+    fs::write(
+        f.0.join("state/claude/new@example.com.json"),
+        new.to_string(),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join(".claude/.claude.json"),
+        serde_json::json!({"oauthAccount": old["account"]}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join(".claude/.credentials.json"),
+        blob("old@example.com", "")["credentials"].to_string(),
+    )
+    .unwrap();
+    let out = f.run(&["use", "claude", "new@example.com", "--local"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&saved).unwrap()).unwrap(),
+        old
+    );
+
+    fs::write(&saved, blob("old@example.com", "").to_string()).unwrap();
+    let current = fs::read(f.0.join(".claude/.credentials.json")).unwrap();
+    let out = f.run(&["use", "claude", "old@example.com", "--local"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("subs login claude old@example.com"));
+    assert_eq!(
+        fs::read(f.0.join(".claude/.credentials.json")).unwrap(),
+        current
+    );
+}
+
 fn token_row(v: &Value) -> &Value {
     v.as_array()
         .unwrap()

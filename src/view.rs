@@ -133,20 +133,29 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     match &r.usage {
         Err(e) => out.push(Line::from(vec![
             edge,
-            span(format!("   spend n/a · {e}"), fg(Color::Red)),
+            span(
+                format!("   {e}"),
+                fg(if e.starts_with("saved ·") {
+                    MUTED
+                } else if !r.active && e.starts_with("sign in required") {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                }),
+            ),
         ])),
         Ok(u) if u.windows.is_empty() => {
             out.push(Line::from(vec![edge, muted("   no usage reported")]))
         }
         Ok(u) => out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw))),
     }
-    if let Some(t) = &r.token {
+    if let Some(t) = r.token.as_ref().filter(|t| t["present"] == true) {
         out.push(Line::from(vec![muted(format!(
             "    {}",
             crate::prov::claude::health_summary(t)
         ))]));
     }
-    if let Ok(u) = &r.usage {
+    if let Some(u) = r.usage.as_ref().ok().filter(|u| u.spend.used.is_some()) {
         out.push(Line::from(vec![muted(format!(
             "    spend {}",
             u.spend.summary()
@@ -272,4 +281,50 @@ fn sgr(c: Color) -> Option<&'static str> {
         Color::DarkGray => "90",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prov::{Prov, Spend, Usage};
+
+    #[test]
+    fn normal_subscription_card_omits_unavailable_spend_and_absent_token() {
+        let mut row = Row {
+            prov: Prov::Claude,
+            email: "a@example.com".into(),
+            active: true,
+            password: false,
+            token: Some(serde_json::json!({"present": false, "state": "absent"})),
+            usage: Ok(Usage {
+                spend: Spend::unknown("flat subscription; dollar spend not exposed"),
+                plan: Some("max 20x".into()),
+                windows: vec![Win {
+                    label: "7d".into(),
+                    pct: Some(0.0),
+                    reset: None,
+                }],
+                resets: None,
+                extra: None,
+                limited: false,
+            }),
+        };
+        let render = |r: &Row| {
+            card(r, false, 76, 35)
+                .iter()
+                .map(|l| ansi(l, false))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = render(&row);
+        assert!(text.contains("max 20x") && text.contains("100%"));
+        assert!(!text.contains("spend") && !text.contains("setup-token"));
+        row.usage.as_mut().unwrap().spend.cap = Some(200.0);
+        assert!(!render(&row).contains("spend"));
+        row.usage.as_mut().unwrap().spend.used = Some(1.25);
+        assert!(render(&row).contains("spend"));
+        row.usage = Err("HTTP 401".into());
+        assert!(render(&row).contains("HTTP 401"));
+        assert!(!render(&row).contains("spend n/a"));
+    }
 }

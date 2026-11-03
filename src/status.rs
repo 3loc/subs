@@ -98,18 +98,17 @@ pub fn status() -> Vec<Row> {
 
 fn fetch(p: Prov, blob: &Value, active: bool) -> Result<Usage, String> {
     if !p.has_token(blob) {
-        return Err(
-            "signed out on this host · token cleared, cannot refresh · sign in again with l".into(),
-        );
+        return Err(format!(
+            "sign in required · subs login {} {}",
+            p.name(),
+            p.email(blob).unwrap_or_default()
+        ));
     }
     if p.expires(blob).is_some_and(|t| t < now()) {
         return Err(if active {
-            format!(
-                "token expired · run {} once, or sign in again with l",
-                p.name()
-            )
+            format!("session expired · run {} to refresh", p.name())
         } else {
-            "token expired · refreshes once in use".into()
+            "saved · select to refresh usage".into()
         });
     }
     p.usage(blob)
@@ -157,10 +156,23 @@ pub fn to_json(rows: &[Row]) -> Value {
 mod tests {
     use super::*;
     #[test]
+    fn expired_saved_login_is_distinct_from_active_session_failure() {
+        let blob =
+            json!({"credentials": {"claudeAiOauth": {"accessToken": "synthetic", "expiresAt": 1}}});
+        assert_eq!(
+            fetch(Prov::Claude, &blob, false).err().unwrap(),
+            "saved · select to refresh usage"
+        );
+        assert_eq!(
+            fetch(Prov::Claude, &blob, true).err().unwrap(),
+            "session expired · run claude to refresh"
+        );
+    }
+    #[test]
     fn cleared_claude_credential_is_signed_out_not_expired() {
         let blob = json!({"credentials": {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}, "account": {"emailAddress": "a@example.com"}});
         let e = fetch(Prov::Claude, &blob, false).err().unwrap();
-        assert!(e.starts_with("signed out on this host"), "{e}");
+        assert_eq!(e, "sign in required · subs login claude a@example.com");
         assert!(!Prov::Claude.has_token(&blob));
     }
     #[test]

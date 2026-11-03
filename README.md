@@ -151,7 +151,12 @@ open the printed browser URL; then run `subs push cursor`.
 
 ## Spending
 
-Status cards (including the TUI) show spend per account. `subs json` adds a
+Status cards (including the TUI) show spend when the provider reports an amount.
+Unavailable dollar spend and absent setup-tokens are omitted from the cards.
+Saved accounts that need a token refresh show a muted status; accounts with
+cleared credentials show the command to sign in again. Status never refreshes
+tokens itself, since that can invalidate credentials copied to other machines.
+`subs json` adds a
 `spend` object with `used`, `cap`, `currency`, `period`, and `reason`. Unknown
 amounts are null, never zero. Codex and Claude show the provider’s plan and
 usage windows; subscription dollar spend is n/a because those APIs do not
