@@ -48,7 +48,11 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
     let live = p.read(None);
     let cur = live.as_ref().and_then(|b| p.email(b));
     let same = cur.as_deref() == Some(email);
-    if same && !force && !(p == Prov::Claude && crate::prov::claude::token_configured()) {
+    if same
+        && !force
+        && live.as_ref().is_some_and(|b| p.has_token(b))
+        && !(p == Prov::Claude && crate::prov::claude::token_configured())
+    {
         return Ok(format!("{name}: {email} is already active"));
     }
     if let (Some(c), Some(l), false) = (&cur, &live, same) {

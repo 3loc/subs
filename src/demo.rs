@@ -44,7 +44,7 @@ fn row(
         active,
         password: true,
         token: None,
-        usage: Ok(usage),
+        usage: crate::status::UsageState::Available(usage),
     }
 }
 

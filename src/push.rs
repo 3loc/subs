@@ -434,20 +434,21 @@ pub fn active(p: Prov) -> Result<Value, String> {
     if p == Prov::Claude && claude::load_token()?.is_some() {
         return Ok(json!({"setup_token": true}));
     }
-    p.read(None)
-        .ok_or_else(|| format!("no live {} login to push", p.name()))
+    let blob = p
+        .read(None)
+        .ok_or_else(|| format!("no live {} login to push", p.name()))?;
+    if !p.has_token(&blob) {
+        return Err(format!(
+            "refusing to push cleared {} credentials · subs login {} {}",
+            p.name(),
+            p.name(),
+            p.email(&blob).unwrap_or_default()
+        ));
+    }
+    Ok(blob)
 }
 
 pub fn cli(p: Prov, restart_t3: bool) -> bool {
-    let hosts = hosts(p);
-    if hosts.is_empty() {
-        println!(
-            "{}: no hosts to push to · list them in {}",
-            p.name(),
-            config().display()
-        );
-        return !restart_t3 || restart_local_t3();
-    }
     let blob = if crate::demo::on() {
         serde_json::json!({"demo": true})
     } else {
@@ -459,6 +460,15 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
             }
         }
     };
+    let hosts = hosts(p);
+    if hosts.is_empty() {
+        println!(
+            "{}: no hosts to push to · list them in {}",
+            p.name(),
+            config().display()
+        );
+        return !restart_t3 || restart_local_t3();
+    }
     let email = if crate::demo::on() {
         crate::demo::ACTIVE.lock().unwrap().to_string()
     } else {

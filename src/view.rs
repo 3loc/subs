@@ -5,7 +5,7 @@
 //! ▎   weekly  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━─  97% left   resets in 6d 19h
 
 use crate::prov::{Win, ALL};
-use crate::status::{until, Row};
+use crate::status::{until, Row, UsageState};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -131,7 +131,19 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     head.extend(meta);
     let mut out = vec![Line::from(head)];
     match &r.usage {
-        Err(e) => out.push(Line::from(vec![
+        UsageState::InactiveOAuth(_) => {
+            out.push(Line::from(vec![
+                edge,
+                muted("   saved OAuth login · inactive (setup-token selected)"),
+            ]));
+        }
+        UsageState::Unsupported => {
+            out.push(Line::from(vec![
+                edge,
+                muted("   account and usage reporting not supported by this token"),
+            ]));
+        }
+        UsageState::Error(e) => out.push(Line::from(vec![
             edge,
             span(
                 format!("   {e}"),
@@ -144,10 +156,12 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
                 }),
             ),
         ])),
-        Ok(u) if u.windows.is_empty() => {
+        UsageState::Available(u) if u.windows.is_empty() => {
             out.push(Line::from(vec![edge, muted("   no usage reported")]))
         }
-        Ok(u) => out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw))),
+        UsageState::Available(u) => {
+            out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw)))
+        }
     }
     if let Some(t) = r.token.as_ref().filter(|t| t["present"] == true) {
         out.push(Line::from(vec![muted(format!(
@@ -155,7 +169,7 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
             crate::prov::claude::health_summary(t)
         ))]));
     }
-    if let Some(u) = r.usage.as_ref().ok().filter(|u| u.spend.used.is_some()) {
+    if let Some(u) = r.usage.reported().filter(|u| u.spend.used.is_some()) {
         out.push(Line::from(vec![muted(format!(
             "    spend {}",
             u.spend.summary()
@@ -166,7 +180,9 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
 
 /// Right-hand side of a card's first line: state, credits, resets, plan.
 fn meta(r: &Row) -> Vec<Span<'static>> {
-    let Ok(u) = &r.usage else { return vec![] };
+    let Some(u) = r.usage.reported() else {
+        return vec![];
+    };
     let mut parts: Vec<Vec<Span<'static>>> = vec![];
     if u.limited {
         parts.push(vec![span(
@@ -289,6 +305,68 @@ mod tests {
     use crate::prov::{Prov, Spend, Usage};
 
     #[test]
+    fn configured_token_keeps_dormant_oauth_states_neutral_but_preserves_actual_failures() {
+        let mut rows = vec![
+            Row {
+                prov: Prov::Claude,
+                email: "old@example.com".into(),
+                active: false,
+                password: false,
+                token: None,
+                usage: UsageState::InactiveOAuth(
+                    "sign in required · subs login claude old@example.com".into(),
+                ),
+            },
+            Row {
+                prov: Prov::Claude,
+                email: String::new(),
+                active: true,
+                password: false,
+                token: Some(
+                    serde_json::json!({"present": true, "state": "unverified", "valid": null}),
+                ),
+                usage: UsageState::Unsupported,
+            },
+        ];
+        let render = |rows: &[Row]| {
+            body(rows, None, 76)
+                .lines
+                .iter()
+                .map(|l| ansi(l, true))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = render(&rows);
+        assert!(text.contains("saved OAuth login · inactive (setup-token selected)"));
+        assert!(text.contains("setup-token: configured"));
+        assert!(text.contains("account and usage reporting not supported"));
+        assert!(!text.contains("sign in required") && !text.contains("unverified"));
+        assert!(!text.contains("\x1b[31m") && !text.contains("\x1b[33m"));
+        let json = crate::status::to_json(&rows);
+        assert!(json[0].get("err").is_none());
+        assert_eq!(json[0]["usage_status"], "inactive");
+        assert!(json[0]["inactive_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sign in required"));
+        assert!(json[1].get("err").is_none());
+        assert_eq!(json[1]["usage_status"], "unsupported");
+        assert_eq!(json[1]["setup_token"]["state"], "unverified");
+        assert!(json[1]["setup_token"]["valid"].is_null());
+
+        rows[1].usage = UsageState::Error("HTTP 401".into());
+        assert!(render(&rows).contains("\x1b[31m   HTTP 401"));
+        rows[1].active = false;
+        rows[1].token = Some(
+            serde_json::json!({"present": true, "state": "unusable", "error": "unsafe permissions"}),
+        );
+        let text = render(&rows);
+        assert!(text.contains("setup-token: unusable") && text.contains("unsafe permissions"));
+        rows[0].usage = UsageState::Error("sign in required".into());
+        assert!(render(&rows).contains("sign in required"));
+    }
+
+    #[test]
     fn normal_subscription_card_omits_unavailable_spend_and_absent_token() {
         let mut row = Row {
             prov: Prov::Claude,
@@ -296,7 +374,7 @@ mod tests {
             active: true,
             password: false,
             token: Some(serde_json::json!({"present": false, "state": "absent"})),
-            usage: Ok(Usage {
+            usage: UsageState::Available(Usage {
                 spend: Spend::unknown("flat subscription; dollar spend not exposed"),
                 plan: Some("max 20x".into()),
                 windows: vec![Win {
@@ -319,11 +397,15 @@ mod tests {
         let text = render(&row);
         assert!(text.contains("max 20x") && text.contains("100%"));
         assert!(!text.contains("spend") && !text.contains("setup-token"));
-        row.usage.as_mut().unwrap().spend.cap = Some(200.0);
+        if let UsageState::Available(u) = &mut row.usage {
+            u.spend.cap = Some(200.0);
+        }
         assert!(!render(&row).contains("spend"));
-        row.usage.as_mut().unwrap().spend.used = Some(1.25);
+        if let UsageState::Available(u) = &mut row.usage {
+            u.spend.used = Some(1.25);
+        }
         assert!(render(&row).contains("spend"));
-        row.usage = Err("HTTP 401".into());
+        row.usage = UsageState::Error("HTTP 401".into());
         assert!(render(&row).contains("HTTP 401"));
         assert!(!render(&row).contains("spend n/a"));
     }

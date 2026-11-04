@@ -6,12 +6,28 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::thread;
 
+pub enum UsageState {
+    Available(Usage),
+    Unsupported,
+    InactiveOAuth(String),
+    Error(String),
+}
+
+impl UsageState {
+    pub fn reported(&self) -> Option<&Usage> {
+        match self {
+            Self::Available(u) => Some(u),
+            _ => None,
+        }
+    }
+}
+
 pub struct Row {
     pub prov: Prov,
     pub email: String,
     pub active: bool,
     pub password: bool,
-    pub usage: Result<Usage, String>,
+    pub usage: UsageState,
     pub token: Option<Value>,
 }
 
@@ -60,10 +76,12 @@ pub fn status() -> Vec<Row> {
             .into_iter()
             .map(|(prov, email, active, password, blob)| {
                 s.spawn(move || {
-                    let usage = match &blob {
+                    let result = match &blob {
                         Some(b) => fetch(prov, b, active),
                         None => Err("not logged in".into()),
                     };
+                    let usage =
+                        classify_usage(result, prov == Prov::Claude && has_token && !active);
                     Row {
                         prov,
                         email,
@@ -85,15 +103,30 @@ pub fn status() -> Vec<Row> {
             email: String::new(),
             active: token["state"] == "unverified",
             password: false,
-            usage: Err(
-                "setup-token account and usage unavailable (no verification request sent)".into(),
-            ),
+            usage: if token["state"] == "unverified" {
+                UsageState::Unsupported
+            } else {
+                UsageState::Error(
+                    token["error"]
+                        .as_str()
+                        .unwrap_or("setup-token is unusable")
+                        .into(),
+                )
+            },
             token: Some(token),
         });
     } else if let Some(r) = rows.iter_mut().find(|r| r.prov == Prov::Claude) {
         r.token = Some(token);
     }
     rows
+}
+
+fn classify_usage(result: Result<Usage, String>, inactive_oauth: bool) -> UsageState {
+    match result {
+        Ok(u) => UsageState::Available(u),
+        Err(e) if inactive_oauth => UsageState::InactiveOAuth(e),
+        Err(e) => UsageState::Error(e),
+    }
 }
 
 fn fetch(p: Prov, blob: &Value, active: bool) -> Result<Usage, String> {
@@ -134,11 +167,24 @@ pub fn to_json(rows: &[Row]) -> Value {
             let mut o = json!({"provider": r.prov.name(), "email": r.email, "active": r.active, "password": r.password});
             if let Some(token) = &r.token { o["setup_token"] = token.clone(); }
             match &r.usage {
-                Err(e) => {
+                UsageState::Error(e) => {
+                    o["usage_status"] = json!("error");
                     o["err"] = json!(e);
                     o["spend"] = crate::prov::Spend::unknown(e).json();
                 },
-                Ok(u) => {
+                UsageState::Unsupported => {
+                    o["usage_status"] = json!("unsupported");
+                    o["windows"] = Value::Null;
+                    o["spend"] = crate::prov::Spend::unknown("token does not support usage reporting").json();
+                },
+                UsageState::InactiveOAuth(reason) => {
+                    o["usage_status"] = json!("inactive");
+                    o["inactive_reason"] = json!(reason);
+                    o["windows"] = Value::Null;
+                    o["spend"] = crate::prov::Spend::unknown("saved OAuth login is inactive").json();
+                },
+                UsageState::Available(u) => {
+                    o["usage_status"] = json!("available");
                     o["plan"] = json!(u.plan);
                     o["spend"] = u.spend.json();
                     o["windows"] = u.windows.iter().map(|w| json!([w.label, w.pct, w.reset])).collect();
@@ -183,14 +229,11 @@ mod tests {
             active: false,
             password: false,
             token: None,
-            usage: Err("not logged in".into()),
+            usage: UsageState::Error("not logged in".into()),
         }];
         let v = to_json(&rows);
         assert!(v[0]["spend"]["used"].is_null());
         assert!(v[0]["spend"]["cap"].is_null());
-        assert_eq!(
-            v[0]["spend"]["reason"],
-            rows[0].usage.as_ref().err().unwrap().as_str()
-        );
+        assert_eq!(v[0]["spend"]["reason"], "not logged in");
     }
 }

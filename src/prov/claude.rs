@@ -145,7 +145,14 @@ fn health_at(path: &Path) -> Value {
 }
 
 pub(crate) fn health_summary(h: &Value) -> String {
-    let mut s = format!("setup-token: {}", h["state"].as_str().unwrap_or("unknown"));
+    // "Configured" describes local file checks, not a provider verification.
+    // Keep the machine-readable state and validity unknown until actually checked.
+    let state = match h["state"].as_str() {
+        Some("unverified") => "configured",
+        Some(s) => s,
+        None => "unknown",
+    };
+    let mut s = format!("setup-token: {state}");
     if let Some(e) = h["error"].as_str() {
         s += &format!(" · {e}");
     }
@@ -440,7 +447,7 @@ mod tests {
             email: String::new(),
             active: true,
             password: false,
-            usage: Err("unverified".into()),
+            usage: crate::status::UsageState::Unsupported,
             token: Some(h),
         };
         let rows = [row];
@@ -452,7 +459,7 @@ mod tests {
             .map(|l| crate::view::ansi(l, false))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(status.contains("setup-token: unverified"));
+        assert!(status.contains("setup-token: configured"));
         assert!(status.contains("estimated expiry passed"));
         for output in [json, status, format!("{:?}", fake())] {
             assert!(!output.contains(FAKE));

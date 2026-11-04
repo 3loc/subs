@@ -54,6 +54,11 @@ Offline hosts are skipped and get it on the next push. A host that already has
 the same login with a newer token keeps it. `subs use --local` switches only this
 machine.
 
+A cleared live login is refused before any host is contacted or T3 is restarted.
+`subs use` can restore a saved login even when that account is already selected
+but its live credential was cleared. A revoked saved login still needs a fresh
+browser sign-in; restoring the file cannot make a revoked token valid again.
+
 T3 can retain a previous Claude token in its process environment. To restart
 active `t3code.service` systemd user services after installing Claude credentials:
 
@@ -173,6 +178,16 @@ open the printed browser URL; then run `subs push cursor`.
 ## Spending
 
 Status cards (including the TUI) show spend when the provider reports an amount.
+With a configured setup-token selected, saved OAuth logins with unavailable
+usage are shown as inactive. They do not describe the active token's health.
+`setup-token: configured` means the local token file passed format and permission
+checks; it does not claim a provider verification. Account identity and usage
+reporting are unsupported by this token. JSON uses `usage_status` values
+`available`, `unsupported`, `inactive`, or `error`. Unsupported token usage and
+inactive OAuth logins have no `err` field; saved-login diagnostics are available
+as `inactive_reason`. The token metadata keeps the `unverified` state and unknown
+validity until a real provider check is performed. Token file failures and
+active-login failures remain errors.
 Unavailable dollar spend and absent setup-tokens are omitted from the cards.
 Saved accounts that need a token refresh show a muted status; accounts with
 cleared credentials show the command to sign in again. Status never refreshes

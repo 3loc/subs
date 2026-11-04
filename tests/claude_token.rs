@@ -159,6 +159,84 @@ fn switching_accounts_preserves_saved_credentials_when_live_login_was_cleared() 
     );
 }
 
+#[test]
+fn selecting_the_same_account_restores_its_cleared_live_credentials() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("state/claude")).unwrap();
+    fs::create_dir_all(f.0.join(".claude")).unwrap();
+    let saved = serde_json::json!({
+        "account": {"emailAddress": "test@example.invalid"},
+        "credentials": {"claudeAiOauth": {"accessToken": "synthetic-saved"}}
+    });
+    let snapshot = f.0.join("state/claude/test@example.invalid.json");
+    fs::write(&snapshot, saved.to_string()).unwrap();
+    fs::write(
+        f.0.join(".claude/.claude.json"),
+        serde_json::json!({"oauthAccount": saved["account"]}).to_string(),
+    )
+    .unwrap();
+    let live = f.0.join(".claude/.credentials.json");
+    fs::write(
+        &live,
+        serde_json::json!({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}).to_string(),
+    )
+    .unwrap();
+    let out = f.run(&["use", "claude", "test@example.invalid", "--local"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("signed in again"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(live).unwrap()).unwrap(),
+        saved["credentials"]
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(snapshot).unwrap()).unwrap(),
+        saved
+    );
+    let out = f.run(&["use", "claude", "test@example.invalid", "--local"], "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("is already active"));
+}
+
+#[test]
+fn cleared_live_credentials_cannot_be_pushed_or_restart_t3() {
+    for with_hosts in [false, true] {
+        let f = Fixture::new();
+        fs::create_dir_all(f.0.join(".claude")).unwrap();
+        fs::create_dir_all(f.0.join(".config/subs")).unwrap();
+        if with_hosts {
+            f.hosts();
+        }
+        fs::write(
+            f.0.join(".claude/.credentials.json"),
+            serde_json::json!({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            f.0.join(".claude/.claude.json"),
+            serde_json::json!({"oauthAccount": {"emailAddress": "test@example.invalid"}})
+                .to_string(),
+        )
+        .unwrap();
+        for tool in ["ssh", "systemctl", "systemd-run"] {
+            f.stub(tool, "touch \"$HOME/side-effect\"; exit 0\n");
+        }
+        for args in [
+            vec!["push", "claude"],
+            vec!["push", "claude", "--restart-t3"],
+        ] {
+            let out = f.run(&args, "");
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("refusing to push cleared claude credentials"));
+            assert!(!f.0.join("side-effect").exists());
+        }
+    }
+}
+
 fn token_row(v: &Value) -> &Value {
     v.as_array()
         .unwrap()
@@ -193,9 +271,62 @@ fn stdin_install_status_json_and_private_storage() {
     let out = f.run(&["status"], "");
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("setup-token: unverified"));
+    assert!(text.contains("setup-token: configured"));
     assert!(text.contains("estimated expiry in"));
     assert_eq!(fs::read_dir(f.0.join("state")).unwrap().count(), 0);
+}
+
+#[test]
+fn repeated_status_does_not_report_inactive_oauth_or_unsupported_token_usage_as_errors() {
+    let f = Fixture::new();
+    f.install();
+    let token_before = fs::read(f.env_path()).unwrap();
+    fs::create_dir_all(f.0.join(".claude")).unwrap();
+    fs::create_dir_all(f.0.join("state/claude")).unwrap();
+    let account = serde_json::json!({"emailAddress": "old@example.invalid"});
+    let credentials = serde_json::json!({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}});
+    fs::write(
+        f.0.join(".claude/.credentials.json"),
+        credentials.to_string(),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join(".claude/.claude.json"),
+        serde_json::json!({"oauthAccount": account}).to_string(),
+    )
+    .unwrap();
+    let snapshot = f.0.join("state/claude/old@example.invalid.json");
+    fs::write(
+        &snapshot,
+        serde_json::json!({"credentials": credentials, "account": account}).to_string(),
+    )
+    .unwrap();
+    let snapshot_before = fs::read(&snapshot).unwrap();
+    for _ in 0..2 {
+        let out = f.run(&["status"], "");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success());
+        assert!(text.contains("saved OAuth login · inactive"));
+        assert!(text.contains("setup-token: configured"));
+        assert!(
+            !text.contains("sign in required") && !text.contains("no verification request sent")
+        );
+        let v = f.json();
+        let rows: Vec<_> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["provider"] == "claude")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|r| r["active"] == true).count(), 1);
+        assert!(rows.iter().all(|r| r.get("err").is_none()));
+        assert_eq!(rows[0]["usage_status"], "inactive");
+        assert_eq!(rows[1]["usage_status"], "unsupported");
+        assert!(rows[1]["setup_token"]["valid"].is_null());
+        assert_eq!(fs::read(f.env_path()).unwrap(), token_before);
+        assert_eq!(fs::read(&snapshot).unwrap(), snapshot_before);
+    }
 }
 
 #[test]
