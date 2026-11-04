@@ -475,6 +475,7 @@ dependencies = [
 name = "subs"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "ratatui",
  "serde_json",
 ]

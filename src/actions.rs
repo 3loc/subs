@@ -28,9 +28,17 @@ fn running(name: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Swap a saved login in, saving the current one first.
+/// Swap a saved login in, saving the current one first. An account already
+/// live on its Claude subscription token stays on it: selecting it again must
+/// not trade a working long-lived token for a saved OAuth login.
 pub fn use_(p: Prov, email: &str) -> Res {
     activate(p, email, false)
+}
+
+/// The explicit switch to an account's saved OAuth login, even when the
+/// subscription token labelled with that account is the live one.
+pub fn use_oauth(p: Prov, email: &str) -> Res {
+    activate(p, email, true)
 }
 
 /// `force` rewrites the login even when the same account is already live,
@@ -40,6 +48,9 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
         return Ok(crate::demo::switch(email));
     }
     let name = p.name();
+    if p == Prov::Claude && !force && crate::prov::claude::token_email().as_deref() == Some(email) {
+        return Ok(format!("{name}: {email} is already active"));
+    }
     let blob = rjson(&snap_path(p, email))
         .ok_or_else(|| format!("no saved {name} login for {email} · subs login {name} {email}"))?;
     if !p.has_token(&blob) {
@@ -60,14 +71,21 @@ fn activate(p: Prov, email: &str, force: bool) -> Res {
             wjson(&snap_path(p, c), l).map_err(io)?;
         }
     }
+    // The token, not the OAuth file, was what this machine used.
+    let token = (p == Prov::Claude && crate::prov::claude::token_configured()).then(|| {
+        crate::prov::claude::token_email()
+            .map_or("subscription token".into(), |e| format!("{e} [token]"))
+    });
     p.write(&blob)?;
     if p == Prov::Claude {
         crate::prov::claude::install_env(None)?;
     }
-    let mut msg = if same {
-        format!("{name}: {email} signed in again")
-    } else {
-        format!("{name}: {} → {email}", cur.as_deref().unwrap_or("–"))
+    let mut msg = match &token {
+        Some(from) => format!(
+            "{name}: {from} → {email} [OAuth] · subscription token removed from this machine"
+        ),
+        None if same => format!("{name}: {email} signed in again"),
+        None => format!("{name}: {} → {email}", cur.as_deref().unwrap_or("–")),
     };
     match running(name) {
         0 => {}
@@ -154,16 +172,7 @@ pub fn login(p: Prov, email: Option<&str>, use_it: bool) -> Result<Login, String
     }
     let dir = store::root().join(name);
     store::mkdir(&dir).map_err(io)?;
-    for ent in fs::read_dir(&dir).map_err(io)?.flatten() {
-        // left behind by a login that was killed hard
-        let stale = ent
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(3600));
-        if stale && ent.file_name().to_string_lossy().starts_with(".login-") {
-            let _ = fs::remove_dir_all(ent.path());
-        }
-    }
+    store::sweep_logins(&dir);
     // macOS keeps the default Claude login in the keychain under a name tied
     // to the config dir, so there it signs in in place and puts the old one back.
     let inplace = p == Prov::Claude && claude_keychain(None);
@@ -251,12 +260,25 @@ pub fn read_secret(prompt: &str) -> String {
 }
 
 pub fn read_secret_checked(prompt: &str) -> Result<String, String> {
+    read_secret_until(prompt, &|| false).map(Option::unwrap_or_default)
+}
+
+/// As `read_secret_checked`, but gives up with None once `stop` says so.
+pub fn read_secret_until(prompt: &str, stop: &dyn Fn() -> bool) -> Result<Option<String>, String> {
     eprint!("{prompt}");
     let _ = io::stderr().flush();
     let mut s = String::new();
     terminal::enable_raw_mode()
         .map_err(|_| "cannot disable terminal echo; refusing secret input")?;
     loop {
+        if stop() {
+            let _ = terminal::disable_raw_mode();
+            eprintln!();
+            return Ok(None);
+        }
+        if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            continue;
+        }
         let Ok(Event::Key(k)) = event::read() else {
             continue;
         };
@@ -279,5 +301,5 @@ pub fn read_secret_checked(prompt: &str) -> Result<String, String> {
     }
     let _ = terminal::disable_raw_mode();
     eprintln!();
-    Ok(s)
+    Ok(Some(s))
 }

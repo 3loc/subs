@@ -271,7 +271,7 @@ fn stdin_install_status_json_and_private_storage() {
     let out = f.run(&["status"], "");
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("setup-token: configured"));
+    assert!(text.contains("configured"));
     assert!(text.contains("estimated expiry in"));
     assert_eq!(fs::read_dir(f.0.join("state")).unwrap().count(), 0);
 }
@@ -306,8 +306,8 @@ fn repeated_status_does_not_report_inactive_oauth_or_unsupported_token_usage_as_
         let out = f.run(&["status"], "");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success());
-        assert!(text.contains("saved OAuth login · inactive"));
-        assert!(text.contains("setup-token: configured"));
+        assert!(text.contains("saved login · inactive"));
+        assert!(text.contains("configured"));
         assert!(
             !text.contains("sign in required") && !text.contains("no verification request sent")
         );
@@ -327,6 +327,79 @@ fn repeated_status_does_not_report_inactive_oauth_or_unsupported_token_usage_as_
         assert_eq!(fs::read(f.env_path()).unwrap(), token_before);
         assert_eq!(fs::read(&snapshot).unwrap(), snapshot_before);
     }
+}
+
+#[test]
+fn token_email_label_merges_account_card_preserves_age_and_survives_push() {
+    let f = Fixture::new();
+    f.install();
+    let original_env = fs::read(f.env_path()).unwrap();
+    let before = token_row(&f.json())["setup_token"]["installed_at"].clone();
+    let out = f.run(&["label", "claude", "account@example.invalid"], "");
+    assert!(out.status.success());
+    assert_eq!(fs::read(f.env_path()).unwrap(), original_env);
+    fs::create_dir_all(f.0.join("state/claude")).unwrap();
+    let snapshot = f.0.join("state/claude/account@example.invalid.json");
+    fs::write(&snapshot, serde_json::json!({"account":{"emailAddress":"account@example.invalid"},"credentials":{"claudeAiOauth":{"accessToken":"","expiresAt":0}}}).to_string()).unwrap();
+    let v = f.json();
+    let claude: Vec<_> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["provider"] == "claude")
+        .collect();
+    assert_eq!(claude.len(), 1);
+    assert_eq!(claude[0]["email"], "account@example.invalid");
+    assert_eq!(claude[0]["active"], true);
+    assert_eq!(claude[0]["setup_token"]["installed_at"], before);
+    assert_eq!(claude[0]["setup_token"]["identity_source"], "user_label");
+    assert!(claude[0]["setup_token"]["identity_verified"].is_null());
+    assert!(snapshot.exists(), "OAuth snapshot must remain saved");
+    let out = f.run(&["status"], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(text.matches("account@example.invalid").count(), 1);
+    assert!(text.contains("[token]"));
+    assert!(!text.contains("setup-token"));
+    let env = fs::read(f.env_path()).unwrap();
+    assert!(f
+        .run(&["use", "claude", "account@example.invalid", "--local"], "")
+        .status
+        .success());
+    assert_eq!(fs::read(f.env_path()).unwrap(), env);
+    assert!(!f
+        .run(&["label", "claude", "bad@example.invalid\necho unsafe"], "")
+        .status
+        .success());
+    assert_eq!(fs::read(f.env_path()).unwrap(), env);
+    f.hosts();
+    f.stub("ssh", "HOME=\"$TEST_REMOTE_HOME\" XDG_CONFIG_HOME=\"$TEST_REMOTE_HOME/.config\" exec /bin/sh -s\n");
+    assert!(f.run(&["push", "claude"], "").status.success());
+    assert_eq!(
+        fs::read(f.0.join("remote/.config/subs/claude.env")).unwrap(),
+        env
+    );
+    let remote_label: Value = serde_json::from_slice(
+        &fs::read(f.0.join("remote/.config/subs/claude-account.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(remote_label["email"], "account@example.invalid");
+}
+
+#[test]
+fn token_login_accepts_explicit_email_without_exposing_secret() {
+    let f = Fixture::new();
+    let out = f.run(
+        &[
+            "login",
+            "claude",
+            "account@example.invalid",
+            "--token",
+            "--local",
+        ],
+        &format!("{FAKE}\n"),
+    );
+    assert!(out.status.success());
+    assert_eq!(token_row(&f.json())["email"], "account@example.invalid");
 }
 
 #[test]
@@ -645,4 +718,258 @@ fn installer_refuses_symlinks_without_touching_the_target() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+const SECOND: &str = "sk-ant-oat01-FAKE-second-test-only";
+const CODE: &str = "FAKE-AUTH-CODE#FAKE-STATE";
+const URL: &str = "https://claude.com/cai/oauth/authorize?code=true&state=FAKE";
+
+/// A stand-in for `claude setup-token`: a terminal UI drawn with cursor moves,
+/// the sign-in link in an OSC 8 hyperlink, then `token` drawn in two parts.
+/// `check` is the body of `claude -p`, the check of the new token.
+fn fake_claude(f: &Fixture, token: &str, check: &str) {
+    let (a, b) = token.split_at(20);
+    f.stub(
+        "claude",
+        &format!(
+            r#"test "${{ANTHROPIC_API_KEY+x}}" != x
+case "$*" in *sk-ant-*) exit 9;; esac
+case "$1" in
+setup-token)
+  test "${{CLAUDE_CODE_OAUTH_TOKEN+x}}" != x
+  case "$CLAUDE_CONFIG_DIR" in */state/claude/.login-token-*) ;; *) exit 2;; esac
+  test -t 0 && test -t 1
+  printf '\033[2GWelcome\033[10Gto\033[13GClaude\r\n'
+  printf '\033]8;id=1;{URL}\007\033[38;5;246m{URL}\033[39m\033]8;;\007\r\n'
+  printf '\033[2GPaste\033[8Gcode\033[13Ghere\033[18Gif\033[21Gprompted\033[30G>\r\n'
+  IFS= read -r code || exit 0
+  printf '%s' "$code" > "$HOME/code-seen"
+  test "$code" = '{CODE}' || {{ printf 'OAuth error: invalid code\r\n'; exit 1; }}
+  printf 'Your OAuth token (valid for 1 year):\033[38G\033[32m{a}'
+  sleep 0.3
+  printf '{b}\033[39m\r\n\r\nStore this token securely.\r\n'
+  exec sleep 30
+  ;;
+-p)
+  case "$CLAUDE_CONFIG_DIR" in */state/claude/.login-check-*) ;; *) exit 2;; esac
+  case "$(cat)" in *ok*) ;; *) exit 5;; esac
+  printf '%s\n' "$CLAUDE_CODE_OAUTH_TOKEN" > "$HOME/checked-with"
+  {check}
+  ;;
+*) exit 1;;
+esac
+"#
+        ),
+    );
+}
+
+fn no_leftovers(f: &Fixture) {
+    let left: Vec<_> = fs::read_dir(f.0.join("state/claude"))
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn browser_token_login_checks_before_installing_and_remembers_the_account() {
+    let f = Fixture::new();
+    fake_claude(&f, FAKE, "printf 'ok\\n'");
+    let started = std::time::Instant::now();
+    let out = f.run(
+        &[
+            "login",
+            "claude",
+            "account@example.invalid",
+            "--token",
+            "--browser",
+            "--local",
+        ],
+        &format!("{CODE}\n"),
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "setup-token was not ended"
+    );
+    assert!(stderr.contains(&format!("\n{URL}\n")), "{stderr}");
+    assert!(stderr.contains("sign in as account@example.invalid"));
+    assert!(stdout.contains("account@example.invalid [token] installed and checked"));
+    assert!(stdout.contains("is your label"));
+    for text in [&stdout, &stderr] {
+        assert!(!text.contains("FAKE-AUTH-CODE") && !text.contains("sk-ant-"));
+    }
+    assert_eq!(fs::read_to_string(f.0.join("code-seen")).unwrap(), CODE);
+    assert_eq!(
+        fs::read_to_string(f.0.join("checked-with")).unwrap(),
+        format!("{FAKE}\n")
+    );
+    assert!(fs::read_to_string(f.env_path()).unwrap().contains(FAKE));
+    let v = f.json();
+    let r = token_row(&v);
+    assert_eq!(r["email"], "account@example.invalid");
+    assert_eq!(r["active"], true);
+    assert_eq!(r["setup_token"]["identity_source"], "user_label");
+    assert!(r["setup_token"]["identity_verified"].is_null());
+    let text = String::from_utf8_lossy(&f.run(&["status"], "").stdout).to_string();
+    assert!(text.contains("[token]") && text.contains("user-labelled"));
+    no_leftovers(&f);
+}
+
+#[test]
+fn replacement_that_fails_its_check_or_sign_in_keeps_the_current_token() {
+    let f = Fixture::new();
+    let out = f.run(
+        &["login", "claude", "current@example.invalid", "--token"],
+        &format!("{FAKE}\n"),
+    );
+    assert!(out.status.success());
+    let env = fs::read(f.env_path()).unwrap();
+    let label = fs::read(f.0.join(".config/subs/claude-account.json")).unwrap();
+    let args = [
+        "login",
+        "claude",
+        "new@example.invalid",
+        "--token",
+        "--browser",
+        "--local",
+    ];
+    // Rejected by Claude, and its message names the token: neither is shown.
+    fake_claude(
+        &f,
+        SECOND,
+        &format!("printf 'Invalid bearer token {SECOND}\\n' >&2; exit 1"),
+    );
+    let out = f.run(&args, &format!("{CODE}\n"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("failed its check (Invalid bearer token [redacted])"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("current login is unchanged"));
+    assert!(!stderr.contains(SECOND));
+    // A wrong code, input that is not a code, and no code at all: never checked.
+    fs::remove_file(f.0.join("checked-with")).unwrap();
+    fake_claude(&f, SECOND, "printf 'ok\\n'");
+    for (input, says) in [
+        ("WRONG-CODE#WRONG-STATE\n", "OAuth error: invalid code"),
+        ("not a code!\n", "not the code from the sign-in page"),
+        ("", "stdin closed before the code arrived"),
+    ] {
+        let out = f.run(&args, input);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(!stderr.contains("WRONG-CODE") && !stderr.contains(SECOND));
+    }
+    assert!(!f.0.join("checked-with").exists());
+    assert_eq!(fs::read(f.env_path()).unwrap(), env);
+    assert_eq!(
+        fs::read(f.0.join(".config/subs/claude-account.json")).unwrap(),
+        label
+    );
+    assert_eq!(token_row(&f.json())["email"], "current@example.invalid");
+    no_leftovers(&f);
+}
+
+#[test]
+fn an_existing_token_pasted_for_the_code_is_checked_and_installed() {
+    let f = Fixture::new();
+    fake_claude(&f, SECOND, "printf 'ok\\n'");
+    let started = std::time::Instant::now();
+    let out = f.run(
+        &[
+            "login",
+            "claude",
+            "account@example.invalid",
+            "--token",
+            "--browser",
+            "--local",
+        ],
+        &format!("{FAKE}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed().as_secs() < 20);
+    assert!(
+        !f.0.join("code-seen").exists(),
+        "a token is never sent as a code"
+    );
+    assert_eq!(
+        fs::read_to_string(f.0.join("checked-with")).unwrap(),
+        format!("{FAKE}\n")
+    );
+    assert_eq!(token_row(&f.json())["email"], "account@example.invalid");
+}
+
+#[test]
+fn selecting_a_token_labelled_account_keeps_the_token_until_oauth_is_explicit() {
+    let f = Fixture::new();
+    let email = "account@example.invalid";
+    assert!(f
+        .run(&["login", "claude", email, "--token"], &format!("{FAKE}\n"))
+        .status
+        .success());
+    let env = fs::read(f.env_path()).unwrap();
+    // An OAuth sign-in to the same account is saved, and says how to switch.
+    f.stub(
+        "claude",
+        &format!(
+            r#"test "$1 $2" = 'auth login'
+printf '%s\n' '{{"claudeAiOauth":{{"accessToken":"fake-oauth","expiresAt":1}}}}' > "$CLAUDE_CONFIG_DIR/.credentials.json"
+printf '%s\n' '{{"oauthAccount":{{"emailAddress":"{email}"}}}}' > "$CLAUDE_CONFIG_DIR/.claude.json"
+"#
+        ),
+    );
+    let out = f.run(&["login", "claude", email, "--local"], "");
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("subs use claude {email} --oauth"))
+    );
+    assert_eq!(fs::read(f.env_path()).unwrap(), env);
+    let out = f.run(&["use", "claude", email, "--local"], "");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("is already active"));
+    assert_eq!(fs::read(f.env_path()).unwrap(), env);
+    let out = f.run(&["use", "claude", email, "--oauth", "--local"], "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(
+        stdout.contains(&format!("{email} [token] → {email} [OAuth]")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("subscription token removed from this machine"));
+    let env = fs::read_to_string(f.env_path()).unwrap();
+    assert!(env.contains("unset CLAUDE_CODE_OAUTH_TOKEN") && !env.contains(FAKE));
+    assert!(!f.0.join(".config/subs/claude-account.json").exists());
+    let v = f.json();
+    assert_eq!(token_row(&v)["email"], email);
+    assert_eq!(token_row(&v)["active"], true);
+    assert_eq!(token_row(&v)["setup_token"]["present"], false);
+}
+
+#[test]
+fn token_flags_are_only_accepted_where_they_mean_something() {
+    let f = Fixture::new();
+    for args in [
+        vec!["login", "claude", "--browser"],
+        vec!["login", "codex", "--token"],
+        vec!["push", "claude", "--token"],
+        vec!["use", "codex", "a@example.invalid", "--oauth"],
+        vec!["login", "claude", "--oauth"],
+    ] {
+        let out = f.run(&args, "");
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("usage")
+                || String::from_utf8_lossy(&out.stderr).contains("--oauth")
+        );
+    }
+    assert!(!f.env_path().exists());
 }

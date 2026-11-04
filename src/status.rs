@@ -98,11 +98,19 @@ pub fn status() -> Vec<Row> {
             .collect()
     });
     if has_token {
+        let email = token["account_email"].as_str().unwrap_or("").to_owned();
+        // One card per account; the OAuth snapshot remains saved on disk.
+        if !email.is_empty() {
+            rows.retain(|r| !(r.prov == Prov::Claude && r.email == email));
+        }
+        let password = acc["claude"][email.as_str()]["password"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
         rows.push(Row {
             prov: Prov::Claude,
-            email: String::new(),
+            email,
             active: token["state"] == "unverified",
-            password: false,
+            password,
             usage: if token["state"] == "unverified" {
                 UsageState::Unsupported
             } else {

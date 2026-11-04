@@ -106,7 +106,7 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     let room = cw.saturating_sub(4 + width(&meta) + 2).max(8);
     let email = trunc(
         if r.email.is_empty() && r.token.as_ref().is_some_and(|t| t["present"] == true) {
-            "setup-token"
+            "Claude subscription"
         } else if r.email.is_empty() {
             "no login"
         } else {
@@ -132,15 +132,12 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(head)];
     match &r.usage {
         UsageState::InactiveOAuth(_) => {
-            out.push(Line::from(vec![
-                edge,
-                muted("   saved OAuth login · inactive (setup-token selected)"),
-            ]));
+            out.push(Line::from(vec![edge, muted("   saved login · inactive")]));
         }
         UsageState::Unsupported => {
             out.push(Line::from(vec![
                 edge,
-                muted("   account and usage reporting not supported by this token"),
+                muted("   usage reporting unavailable"),
             ]));
         }
         UsageState::Error(e) => out.push(Line::from(vec![
@@ -180,8 +177,19 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
 
 /// Right-hand side of a card's first line: state, credits, resets, plan.
 fn meta(r: &Row) -> Vec<Span<'static>> {
+    let badge = if r.prov == crate::prov::Prov::Claude {
+        Some(muted(
+            if r.token.as_ref().is_some_and(|t| t["present"] == true) {
+                "[token]"
+            } else {
+                "[OAuth]"
+            },
+        ))
+    } else {
+        None
+    };
     let Some(u) = r.usage.reported() else {
-        return vec![];
+        return badge.into_iter().collect();
     };
     let mut parts: Vec<Vec<Span<'static>>> = vec![];
     if u.limited {
@@ -210,6 +218,9 @@ fn meta(r: &Row) -> Vec<Span<'static>> {
     }
     if let Some(p) = &u.plan {
         parts.push(vec![span(p.clone(), fg(Color::Magenta))]);
+    }
+    if let Some(badge) = badge {
+        parts.push(vec![badge]);
     }
     let mut out = vec![];
     for (i, p) in parts.into_iter().enumerate() {
@@ -337,9 +348,9 @@ mod tests {
                 .join("\n")
         };
         let text = render(&rows);
-        assert!(text.contains("saved OAuth login · inactive (setup-token selected)"));
-        assert!(text.contains("setup-token: configured"));
-        assert!(text.contains("account and usage reporting not supported"));
+        assert!(text.contains("saved login · inactive"));
+        assert!(text.contains("configured"));
+        assert!(text.contains("usage reporting unavailable"));
         assert!(!text.contains("sign in required") && !text.contains("unverified"));
         assert!(!text.contains("\x1b[31m") && !text.contains("\x1b[33m"));
         let json = crate::status::to_json(&rows);
@@ -361,7 +372,7 @@ mod tests {
             serde_json::json!({"present": true, "state": "unusable", "error": "unsafe permissions"}),
         );
         let text = render(&rows);
-        assert!(text.contains("setup-token: unusable") && text.contains("unsafe permissions"));
+        assert!(text.contains("unusable") && text.contains("unsafe permissions"));
         rows[0].usage = UsageState::Error("sign in required".into());
         assert!(render(&rows).contains("sign in required"));
     }

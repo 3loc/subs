@@ -24,6 +24,8 @@ subs                                    # status of every account
 subs tui                                # interactive view
 subs login codex|claude|cursor [EMAIL]  # sign in; --use makes it active and pushes it
                                         # (signing in as the active account always does)
+subs login claude EMAIL --token         # long-lived Claude token via the browser, checked
+subs label claude EMAIL                 # name the installed token's account
 subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
 subs push codex|claude|cursor           # push the active login to your hosts again
 subs add codex|claude|cursor EMAIL      # store the account's password
@@ -35,7 +37,9 @@ subs rm codex|claude|cursor EMAIL       # forget an account
 ![subs](docs/status.gif)
 
 TUI keys: `j`/`k` move, `enter` use (and push), `f` push again, `l` login, `n` new,
-`a` password, `p` copy password, `d` delete, `r` refresh, `q` quit.
+`t` long-lived Claude token for the account, `a` password, `p` copy password,
+`d` delete, `r` refresh, `q` quit. On a `[token]` card, `l` creates a new token
+for it; the new token goes out to your hosts once checked and installed.
 
 ## Hosts
 
@@ -86,22 +90,50 @@ passwords in plain text at 0600.
 ## Claude setup-token
 
 Use a long-lived subscription token when copying the normal OAuth login means
-frequent reauthentication. Generate it yourself using Claude's browser flow:
+frequent reauthentication. `subs` creates one with Claude's own browser flow
+and remembers which account you signed in with:
 
 ```sh
-unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
-claude setup-token
-subs login claude --token
+subs login claude you@example.com --token
 ```
 
-Paste the generated token at the hidden prompt and press Enter. The token is
-never accepted as a command argument. For a raw token already in a private
-file outside a repository, use stdin instead:
+`subs` runs `claude setup-token` on a private terminal in a throwaway config
+and shows only its sign-in link. Open it, sign in as that account, and paste
+the code the page shows at the hidden prompt (a browser on the same machine
+finishes by itself). The token never reaches your terminal, a log, or a command
+line. Before it replaces anything, `subs` checks it with one small model request
+through `claude -p --model haiku`; a failed check, a wrong code, or Ctrl-C
+leaves the current login exactly as it was.
+
+Without a terminal (over a pipe, or from an agent), `--browser` reads the code
+as one line on stdin while the link goes to stderr. Plain stdin without
+`--browser` still imports a token you already have, unchecked:
 
 ```sh
+subs login claude you@example.com --token --browser < code-fifo
 chmod 600 /absolute/path/to/private-token
-subs login claude --token < /absolute/path/to/private-token
+subs login claude you@example.com --token < /absolute/path/to/private-token
 ```
+
+An existing token pasted at the code prompt is checked and installed the same way.
+
+Accounts are shown by email, with a small `[token]` or `[OAuth]` badge for
+Claude's login method. The email is your label, not a provider-verified
+identity: Claude issues these tokens for model requests only, so they cannot
+report their account. The card says `user-labelled`; JSON has
+`identity_source: "user_label"` and `identity_verified: null`. Without a
+label, the card says `Claude subscription`. Add or correct the label of an
+installed token without signing in again:
+
+```sh
+subs label claude you@example.com
+```
+
+The token and a saved OAuth login for the same email share one card; the OAuth
+snapshot remains on disk. The label lives in `claude-account.json` (0600) beside
+the env file, bound to that token and its installation time, so the env file
+stays exactly what older versions read. Labels travel with token pushes;
+relabelling keeps the token and its original installation time.
 
 This installs `~/.config/subs/claude.env` atomically with mode 0600. If
 `XDG_CONFIG_HOME` is set, the path is `$XDG_CONFIG_HOME/subs/claude.env`.
@@ -145,17 +177,21 @@ absent). `valid` and `expires_at` remain null; `state` is `unverified` for a
 usable local file, and `estimated_expires_at` is installation time plus 365 days.
 This is an estimate, not verification: importing an older token or reinstalling
 the same token can overestimate its remaining life. Remote pushes preserve the
-estimate. The account identity and usage of a setup-token remain unknown.
+estimate. A setup-token's account is only your label; its usage stays unknown.
 
 [Claude's documentation](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)
 describes these as one-year subscription tokens that can only make model requests.
-`subs` does not make a billable request to validate one. They do not provide
+Only the browser flow checks a new token, with one small model request; status
+never makes one. They do not provide
 Remote Control or claude.ai connectors, and Claude's `--bare` mode ignores them.
 
 Normal `subs login claude` still saves an OAuth login in isolation. While a
 setup-token is installed, it stays selected until you explicitly activate OAuth
-with `subs use claude EMAIL` or `subs login claude --use`. That removes the managed
-token locally and on pushed hosts; source the hook again or open new shells.
+with `subs use claude OTHER`, `subs login claude --use`, or, for the account the
+token is labelled with, `subs use claude EMAIL --oauth`. Plain `subs use` (or
+enter in the TUI) on that account keeps the working token. Switching removes
+the managed token locally and on pushed hosts; source the hook again or open
+new shells.
 Claude login subprocesses strip both inherited token and API key variables;
 `subs` warns when `ANTHROPIC_API_KEY` is present without printing its value.
 

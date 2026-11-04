@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
@@ -58,6 +58,20 @@ pub fn mkdtemp(dir: &Path, prefix: &str) -> io::Result<PathBuf> {
         match DirBuilder::new().mode(0o700).create(&p) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             r => return r.map(|_| p),
+        }
+    }
+}
+
+/// Remove `.login-*` directories left behind by a login that was killed hard.
+pub fn sweep_logins(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for ent in rd.flatten() {
+        let stale = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(3600));
+        if stale && ent.file_name().to_string_lossy().starts_with(".login-") {
+            let _ = fs::remove_dir_all(ent.path());
         }
     }
 }

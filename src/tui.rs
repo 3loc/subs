@@ -21,10 +21,11 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const KEYS: [(&str, &str); 8] = [
+const KEYS: [(&str, &str); 9] = [
     ("↵", "use"),
     ("f", "push"),
     ("l", "login"),
+    ("t", "token"),
     ("n", "new"),
     ("a", "pass"),
     ("p", "copy"),
@@ -37,6 +38,7 @@ const TOAST: Duration = Duration::from_secs(6);
 
 enum Then {
     NewLogin(Prov),
+    TokenLogin,
     Password(Prov, String),
     Forget(Prov, String),
     Use(Prov, String),
@@ -112,7 +114,8 @@ struct App {
     updated: Option<Instant>,
     toast: Option<(String, bool, Instant)>,
     modal: Option<Modal>,
-    login: Option<(Prov, Option<String>)>,
+    /// A sign-in to run outside the TUI; true for a Claude subscription token.
+    login: Option<(Prov, Option<String>, bool)>,
     push: Option<Push>,
     quit: bool,
 }
@@ -205,8 +208,15 @@ impl App {
     }
 
     /// Make `email` the live login here, then push it to the hosts.
-    fn switch(&mut self, p: Prov, email: &str) {
-        match actions::use_(p, email) {
+    /// `oauth`: the explicit choice of its OAuth login over a token labelled
+    /// with the same account, as confirmed right after signing in.
+    fn switch(&mut self, p: Prov, email: &str, oauth: bool) {
+        let r = if oauth {
+            actions::use_oauth(p, email)
+        } else {
+            actions::use_(p, email)
+        };
+        match r {
             Ok(note) => {
                 for row in self.rows.iter_mut().filter(|r| r.prov == p) {
                     row.active = row.email == email;
@@ -230,10 +240,16 @@ impl App {
             } else {
                 format!(" and {n} host{}", if n == 1 { "" } else { "s" })
             };
+            let token = p == Prov::Claude
+                && crate::prov::claude::token_email().as_deref() == Some(l.email.as_str());
             self.modal = Some(Modal::Confirm {
                 title: "signed in".into(),
                 text: format!("Use {} for {} now?", l.email, p.name()),
-                detail: format!("it goes live on this machine{hosts}"),
+                detail: if token {
+                    format!("it replaces the subscription token here{hosts}")
+                } else {
+                    format!("it goes live on this machine{hosts}")
+                },
                 verb: "use it",
                 danger: false,
                 then: Then::Use(p, l.email),
@@ -290,14 +306,39 @@ impl App {
         let Some((p, email, active)) = self.cur() else {
             return;
         };
-        if email.is_empty() {
-            if k.code == KeyCode::Char('f') && p == Prov::Claude {
-                self.start_push(p, "claude: pushing the active login".into());
+        // The card of the installed Claude subscription token, labelled or not.
+        let token = self.rows[self.sel]
+            .token
+            .as_ref()
+            .is_some_and(|t| t["present"] == true);
+        match k.code {
+            KeyCode::Char('t') if p == Prov::Claude => return self.token_login(email),
+            KeyCode::Char('l') if token => return self.token_login(email),
+            KeyCode::Char('l') if email.is_empty() => {
+                self.login = Some((p, None, false));
+                return;
             }
-            if k.code == KeyCode::Char('l') {
-                self.login = Some((p, None));
+            KeyCode::Char('f') if token || email.is_empty() => {
+                if p == Prov::Claude {
+                    self.start_push(p, "claude: pushing the active login".into());
+                }
+                return;
             }
-            return;
+            KeyCode::Enter if token => {
+                let who = if email.is_empty() {
+                    "the subscription token"
+                } else {
+                    &email
+                };
+                return self.say(Ok(format!("{who} is already the active claude login")));
+            }
+            KeyCode::Char('d') if token => {
+                return self.say(Err(
+                    "this is the installed token · d forgets saved logins".into()
+                ))
+            }
+            _ if email.is_empty() => return,
+            _ => {}
         }
         match k.code {
             KeyCode::Enter if active => self.say(Ok(format!(
@@ -305,12 +346,12 @@ impl App {
                 p.name()
             ))),
             KeyCode::Enter => {
-                self.switch(p, &email);
+                self.switch(p, &email, false);
             }
             KeyCode::Char('f') => {
                 self.start_push(p, format!("{}: pushing the active login again", p.name()))
             }
-            KeyCode::Char('l') => self.login = Some((p, Some(email))),
+            KeyCode::Char('l') => self.login = Some((p, Some(email), false)),
             KeyCode::Char('a') => {
                 self.modal = Some(Modal::Input {
                     title: "password".into(),
@@ -340,6 +381,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A long-lived subscription token for `email`, asking for the account
+    /// first when the card has none: the token cannot name it itself.
+    fn token_login(&mut self, email: String) {
+        if !email.is_empty() {
+            self.login = Some((Prov::Claude, Some(email), true));
+            return;
+        }
+        self.modal = Some(Modal::Input {
+            title: "new claude token".into(),
+            prompt: "account email you will sign in with · enter to skip".into(),
+            value: String::new(),
+            secret: false,
+            then: Then::TokenLogin,
+        })
     }
 
     fn modal_key(&mut self, k: KeyEvent) {
@@ -397,7 +454,11 @@ impl App {
         match then {
             Then::NewLogin(p) => {
                 let email = value.trim().to_string();
-                self.login = Some((p, (!email.is_empty()).then_some(email)));
+                self.login = Some((p, (!email.is_empty()).then_some(email), false));
+            }
+            Then::TokenLogin => {
+                let email = value.trim().to_string();
+                self.login = Some((Prov::Claude, (!email.is_empty()).then_some(email), true));
             }
             Then::Password(_, _) if value.is_empty() => {
                 self.say(Err("empty password, nothing stored".into()))
@@ -416,7 +477,7 @@ impl App {
                 }
                 self.say(r);
             }
-            Then::Use(p, email) => self.switch(p, &email),
+            Then::Use(p, email) => self.switch(p, &email, true),
             Then::Forget(p, email) => {
                 let r = actions::rm(p, &email);
                 if r.is_ok() {
@@ -466,15 +527,29 @@ pub fn run() -> io::Result<()> {
     app.refresh();
     while !app.quit {
         app.poll();
-        if let Some((p, email)) = app.login.take() {
+        if let Some((p, email, token)) = app.login.take() {
             leave()?;
             let who = email
                 .as_deref()
                 .map(|e| format!(" as {e}"))
                 .unwrap_or_default();
-            println!("\n\x1b[1;36msubs\x1b[0m · signing in to {}{who}", p.name());
+            let what = if token {
+                "creating a long-lived token for"
+            } else {
+                "signing in to"
+            };
+            println!("\n\x1b[1;36msubs\x1b[0m · {what} {}{who}", p.name());
             println!("\x1b[90mfollow the link, finish in the browser; you come back here when it is done\x1b[0m\n");
-            let r = actions::login(p, email.as_deref(), false);
+            // A token is live once installed, so it goes out at once like a re-login.
+            let r = if token {
+                crate::prov::claude::login_token(email.as_deref(), true).map(|msg| actions::Login {
+                    email: email.clone().unwrap_or_default(),
+                    live: true,
+                    msg,
+                })
+            } else {
+                actions::login(p, email.as_deref(), false)
+            };
             if let Err(e) = &r {
                 eprintln!("\n\x1b[31m✗ {e}\x1b[0m · press enter to go back");
                 let _ = io::stdin().lock().read_line(&mut String::new());

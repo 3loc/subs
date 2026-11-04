@@ -432,7 +432,8 @@ echo "subs: $r"
 /// False when a reachable host refused it.
 pub fn active(p: Prov) -> Result<Value, String> {
     if p == Prov::Claude && claude::load_token()?.is_some() {
-        return Ok(json!({"setup_token": true}));
+        return Ok(json!({"setup_token": true,
+            "account": {"emailAddress": claude::health()["account_email"]}}));
     }
     let blob = p
         .read(None)

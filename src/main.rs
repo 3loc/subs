@@ -16,6 +16,7 @@
 mod actions;
 mod demo;
 mod prov;
+mod pty;
 mod push;
 mod status;
 mod store;
@@ -34,10 +35,15 @@ usage: subs [command]
   subs                                    status of every account
   subs tui                                interactive view
   subs login codex|claude|cursor [EMAIL]  sign in; --use also makes it active
-  subs login claude --token             install setup-token from hidden prompt or stdin
-                                          --use also pushes it to your hosts
+  subs login claude EMAIL --token         create a long-lived subscription token in the
+                                          browser, check it, then install it for EMAIL;
+                                          --use also pushes it to your hosts. Without a
+                                          terminal: --browser takes the page's code on
+                                          stdin, else stdin is an existing token
+  subs label claude EMAIL                 name the installed token's account
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
-                                          it to your hosts (--local: just this machine)
+                                          it to your hosts (--local: just this machine;
+                                          --oauth: replace a token labelled EMAIL)
   subs push  codex|claude|cursor          push the active login to your hosts again
   subs add   codex|claude|cursor EMAIL    store the account's password
   subs pass  codex|claude|cursor EMAIL    copy (or print) that password
@@ -146,18 +152,33 @@ fn main() {
             exit(1)
         }
     };
-    if flag("--token") {
-        if cmd != "login" || p != Prov::Claude || email.is_some() {
-            die("usage: subs login claude --token [--use] [--local]; token is read from stdin");
+    if flag("--token") || flag("--browser") {
+        if cmd != "login" || p != Prov::Claude || !flag("--token") {
+            die("usage: subs login claude EMAIL --token [--browser] [--use] [--local]");
         }
-        report(prov::claude::install_token());
+        let tty = io::stdin().is_terminal();
+        report(if tty || flag("--browser") {
+            prov::claude::login_token(email, tty)
+        } else {
+            prov::claude::install_token(email)
+        });
         return fan(flag("--use"));
+    }
+    if flag("--oauth") && (cmd != "use" || p != Prov::Claude) {
+        die("--oauth is for subs use claude EMAIL");
     }
     match cmd {
         "login" => {
             let l = actions::login(p, email, flag("--use")).unwrap_or_else(|e| die(e));
             println!("{}", l.msg);
-            if !l.live {
+            let token = p == Prov::Claude
+                && prov::claude::token_email().as_deref() == Some(l.email.as_str());
+            if !l.live && token {
+                println!(
+                    "{} stays on its subscription token; to replace the token with this login: subs use claude {} --oauth",
+                    l.email, l.email
+                );
+            } else if !l.live {
                 println!(
                     "make it the active login with: subs use {} {}",
                     p.name(),
@@ -175,7 +196,11 @@ fn main() {
         die(format!("usage: subs {cmd} {} EMAIL", p.name()))
     };
     if cmd == "use" {
-        let r = actions::use_(p, email);
+        let r = if flag("--oauth") {
+            actions::use_oauth(p, email)
+        } else {
+            actions::use_(p, email)
+        };
         let switched = r.as_ref().is_ok_and(|m| !m.ends_with("is already active"));
         report(r);
         if switched && !flag("--local") {
@@ -184,6 +209,7 @@ fn main() {
         return fan(switched || flag("--restart-t3"));
     }
     report(match cmd {
+        "label" if p == Prov::Claude => prov::claude::label_token(email),
         "add" => actions::add(p, email),
         "pass" => actions::show_password(p, email),
         "rm" => actions::rm(p, email),
