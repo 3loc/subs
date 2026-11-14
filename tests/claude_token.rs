@@ -34,6 +34,8 @@ impl Fixture {
         ] {
             f.stub(tool, "exit 1\n");
         }
+        // Host-platform branches must never reach this user's real services/keychain.
+        f.stub("uname", "printf 'Linux\\n'\n");
         f
     }
     fn stub(&self, name: &str, body: &str) {
@@ -45,6 +47,7 @@ impl Fixture {
         let mut c = Command::new(env!("CARGO_BIN_EXE_subs"));
         c.env_clear()
             .env("HOME", &self.0)
+            .env("TMPDIR", &self.0)
             .env(
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.0.join("bin").display()),
@@ -459,6 +462,7 @@ fn mock_t3(f: &Fixture) {
 printf '%s:%s\n' "$HOME" "$*" >> "$TEST_REMOTE_HOME/../t3-calls"
 case "$*" in
   '--user is-active --quiet t3code.service') exit "${TEST_T3_INACTIVE:-0}" ;;
+  '--user show t3code.service -p ExecStart --value') printf '%s\n' 'source subs/claude-shell.sh'; exit 0 ;;
   '--user restart t3code.service')
     test -f "$HOME/.config/subs/claude.env"
     exit "${TEST_T3_RESTART_FAIL:-0}" ;;
@@ -518,6 +522,105 @@ esac
         String::from_utf8_lossy(&out.stdout).contains("credentials installed; T3 restart failed")
     );
     assert!(f.0.join("remote/.config/subs/claude.env").exists());
+}
+
+#[test]
+fn t3_restart_refuses_a_linux_service_that_cannot_load_the_managed_token() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    f.stub("systemctl", "case \"$*\" in *is-active*) exit 0;; *show*) echo /opt/example/t3;; *) touch \"$HOME/restarted\";; esac\n");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("must load subs/claude-shell.sh"));
+    assert!(!f.0.join("remote/restarted").exists());
+    assert!(!f.0.join("restarted").exists());
+}
+
+fn mock_macos_t3(f: &Fixture) {
+    f.install();
+    f.hosts();
+    f.stub("uname", "printf 'Darwin\\n'\n");
+    f.stub("ssh", "HOME=\"$TEST_REMOTE_HOME\" XDG_CONFIG_HOME=\"$TEST_REMOTE_HOME/.config\" exec /bin/sh -s\n");
+    for home in [&f.0, &f.0.join("remote")] {
+        let dir = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("com.example.server.plist"), r#"<?xml version="1.0"?><plist version="1.0"><dict>
+<key>Label</key><string>com.example.server</string>
+<key>ProgramArguments</key><array><string>/opt/example/t3</string><string>serve</string><string>--port</string><string>3773</string></array>
+<key>EnvironmentVariables</key><dict><key>KEEP_ME</key><string>existing preference</string></dict>
+</dict></plist>"#).unwrap();
+    }
+    f.stub(
+        "launchctl",
+        r#"
+printf '%s %s\n' "$HOME" "$*" >> "$TEST_REMOTE_HOME/../launchd-calls"
+case "$1" in
+  print) test ! -f "$HOME/unloaded"; printf 'state = running\n pid = 42\n';;
+  bootout) touch "$HOME/unloaded";;
+  bootstrap)
+    # launchd may still be tearing down the previous job.
+    if [ ! -f "$HOME/retried" ]; then touch "$HOME/retried"; exit 5; fi
+    rm -f "$HOME/unloaded";;
+  kickstart) test ! -f "$HOME/unloaded";;
+  submit) exit "${TEST_SCHEDULE_FAIL:-0}";;
+  *) exit 1;;
+esac
+"#,
+    );
+}
+
+#[test]
+fn macos_t3_discovers_labels_preserves_preferences_and_retries_bootstrap() {
+    let f = Fixture::new();
+    mock_macos_t3(&f);
+    for _ in 0..2 {
+        let out = f.run(&["push", "claude", "--restart-t3"], "");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("T3 restarted"));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("T3 restart scheduled"));
+    }
+    let plist =
+        fs::read_to_string(f.0.join("remote/Library/LaunchAgents/com.example.server.plist"))
+            .unwrap();
+    assert!(plist.contains("/opt/example/t3"));
+    assert!(plist.contains("existing preference"));
+    assert_eq!(plist.matches("subs/claude-shell.sh").count(), 2);
+    assert!(!plist.contains(FAKE));
+    let calls = fs::read_to_string(f.0.join("launchd-calls")).unwrap();
+    assert_eq!(calls.matches("bootout").count(), 1);
+    assert_eq!(calls.matches("bootstrap").count(), 2);
+    assert!(calls.contains("kickstart -k gui/"));
+    assert!(calls.contains("submit -l subs-t3-restart-"));
+}
+
+#[test]
+fn macos_t3_does_not_start_inactive_jobs_or_hide_scheduling_failures() {
+    let f = Fixture::new();
+    mock_macos_t3(&f);
+    f.stub("launchctl", "exit 113\n");
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("T3 skipped"));
+    let plist =
+        fs::read_to_string(f.0.join("remote/Library/LaunchAgents/com.example.server.plist"))
+            .unwrap();
+    assert!(!plist.contains("claude-shell.sh"));
+
+    mock_macos_t3(&f);
+    let out = f
+        .command()
+        .args(["push", "claude", "--restart-t3"])
+        .env("TEST_SCHEDULE_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("local T3 restart could not be scheduled")
+    );
 }
 
 #[test]

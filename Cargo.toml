@@ -1,6 +1,6 @@
 [package]
 name = "subs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "See and switch ChatGPT/Codex, Claude, and Cursor subscription logins"
 repository = "https://github.com/3loc/subs"

@@ -59,9 +59,11 @@ usage: subs [command]
 
 Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
 the providers it takes (\"laptop claude\"). Offline hosts are skipped.
-Claude fanout and update: --restart-t3 restarts active t3code user services
-after installation, since T3 keeps the credentials and CLI version it saw at
-startup. The local restart is scheduled last. This interrupts active T3 runs.";
+Claude fanout and update: --restart-t3 reloads active T3 systemd services or
+macOS LaunchAgents after installation, since T3 keeps the credentials and CLI
+version it saw at startup. macOS reloads need Python 3; service labels come from
+existing user configuration. The local restart is scheduled last. This
+interrupts active T3 runs.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");

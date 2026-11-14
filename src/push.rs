@@ -123,6 +123,8 @@ pub(crate) fn finish_t3(good: bool, restart_t3: bool) -> bool {
 /// Only the explicitly requested, already-active user service is restarted.
 /// The source is deferred until after fanout so T3 cannot kill its own push.
 fn t3_script(defer: bool) -> String {
+    let macos = include_str!("t3_macos.py");
+    let mode = if defer { "defer" } else { "apply" };
     let action = if defer {
         r#"command -v systemd-run >/dev/null 2>&1 || exit 1
 systemd-run --user --quiet --collect --unit="subs-t3-restart-$$" --on-active=5s "$(command -v systemctl)" --user try-restart t3code.service >/dev/null 2>&1 || exit 1
@@ -135,13 +137,28 @@ printf 'subs-t3: restarted\n'
 "#
     };
     format!(
-        r#"set -eu
+        r#"set +xv
+set -eu
+if [ "$(uname -s)" = Darwin ]; then
+  command -v python3 >/dev/null 2>&1 || exit 1
+  umask 077
+  d=$(mktemp -d "${{TMPDIR:-/tmp}}/subs-t3.XXXXXX")
+  cat > "$d/restart.py" <<'SUBS_T3_MACOS'
+{macos}
+SUBS_T3_MACOS
+  exec python3 "$d/restart.py" {mode}
+fi
 if ! command -v systemctl >/dev/null 2>&1; then
   printf 'subs-t3: unavailable\n'; exit 0
 fi
 if ! systemctl --user is-active --quiet t3code.service 2>/dev/null; then
   printf 'subs-t3: inactive\n'; exit 0
 fi
+startup=$(systemctl --user show t3code.service -p ExecStart --value 2>/dev/null) || exit 1
+case "$startup" in
+  *subs/claude-shell.sh*) ;;
+  *) printf 'subs-t3: hook-missing\n'; exit 0 ;;
+esac
 {action}"#
     )
 }
@@ -152,6 +169,7 @@ fn t3_result(output: &str) -> Result<&'static str, &'static str> {
         Some("subs-t3: scheduled") => Ok("T3 restart scheduled in 5s; reconnect T3"),
         Some("subs-t3: inactive") => Ok("T3 skipped (user service not active)"),
         Some("subs-t3: unavailable") => Ok("T3 skipped (systemctl unavailable)"),
+        Some("subs-t3: hook-missing") => Err("T3 must load subs/claude-shell.sh at startup"),
         _ => Err("T3 restart not confirmed"),
     }
 }
@@ -621,11 +639,18 @@ mod tests {
         let blob = json!({"credentials": {"claudeAiOauth": {"accessToken": "FAKE-oauth", "expiresAt": 200}},
             "account": {"emailAddress": "new@example.invalid"}});
         crate::store::wjson(&tmp.join(".claude.json"), &state).unwrap();
+        let bin = tmp.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let uname = bin.join("uname");
+        std::fs::write(&uname, "#!/bin/sh\nprintf 'Linux\\n'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o700)).unwrap();
         let script = claude_script(&blob, &state.to_string());
         let mut child = Command::new("sh")
             .arg("-s")
             .env("HOME", &tmp)
             .env("XDG_CONFIG_HOME", tmp.join(".config"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env_remove("ZDOTDIR")
             .env_remove("ENV")
             .env_remove("BASH_ENV")
