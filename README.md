@@ -28,8 +28,10 @@ subs login claude EMAIL --token         # long-lived Claude token via the browse
 subs label claude EMAIL                 # name the installed token's account
 subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
 subs push codex|claude|cursor           # push the active login to your hosts again
+subs update [codex|claude|cursor]       # latest CLI here, then on every host
 subs add codex|claude|cursor EMAIL      # store the account's password
 subs pass codex|claude|cursor EMAIL     # copy (or print) that password
+subs reset codex                        # spend a banked full reset on the active login
 subs json                               # status as JSON
 subs rm codex|claude|cursor EMAIL       # forget an account
 ```
@@ -86,6 +88,28 @@ For setup-tokens, the T3 service must already source the managed
 
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.
+
+## CLI versions
+
+Hosts mostly run the CLIs headless (T3, cron, ssh), where Claude's own updater
+never runs, so they fall behind the versions new models need. Every push
+therefore also brings the host's CLI up to at least this machine's version,
+with the CLI's own updater: `claude install <version>` for a native Claude,
+`claude update`, `codex update` or `cursor-agent update` otherwise. The push
+line shows the host's version, or the change (`claude 2.1.278 → 2.1.325`).
+
+`subs update` first updates the CLIs here to the latest, then brings every host
+up to them, without touching logins:
+
+```sh
+subs update                    # claude, codex and cursor-agent
+subs update claude --local     # just this machine
+subs update claude --restart-t3
+```
+
+A host without the CLI is left without it. T3 keeps the CLI version it saw at
+startup, so it still says "Update Claude Code" until restarted;
+`--restart-t3` restarts active T3 user services after the update, as for a push.
 
 ## Claude setup-token
 

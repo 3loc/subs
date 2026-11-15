@@ -49,6 +49,92 @@ fn parse(u: &Value) -> Result<Usage, String> {
     })
 }
 
+/// Spend one banked full reset on the live login, through Codex's own
+/// app-server. Nothing is spent when no window is used up.
+pub(crate) fn reset() -> Result<&'static str, String> {
+    let mut c = Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("codex: {e}"))?;
+    let r = rpc(&mut c);
+    drop(c.stdin.take());
+    let _ = c.kill();
+    let _ = c.wait();
+    match r?["outcome"].as_str() {
+        Some("reset") | Some("alreadyRedeemed") => Ok("usage reset"),
+        Some("nothingToReset") => Err("nothing to reset: no usage window is used up".into()),
+        Some("noCredit") => Err("no full resets left".into()),
+        _ => Err("codex did not confirm the reset".into()),
+    }
+}
+
+/// initialize, then consume a reset credit; the consume result.
+fn rpc(c: &mut std::process::Child) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader};
+    let mut stdin = c.stdin.take().ok_or("codex app-server: no stdin")?;
+    let out = BufReader::new(c.stdout.take().ok_or("codex app-server: no stdout")?);
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    std::thread::spawn(move || {
+        for line in out.lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if v["id"].is_number() && tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let mut send = |v: Value| writeln!(stdin, "{v}").map_err(|e| format!("codex app-server: {e}"));
+    let wait = |id: u64| -> Result<Value, String> {
+        loop {
+            let v = rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .map_err(|_| "codex app-server did not answer".to_string())?;
+            if v["id"] == id {
+                if let Some(e) = v.get("error") {
+                    return Err(format!(
+                        "codex: {}",
+                        e["message"].as_str().unwrap_or("error")
+                    ));
+                }
+                return Ok(v["result"].clone());
+            }
+        }
+    };
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"clientInfo": {"name": "subs", "version": env!("CARGO_PKG_VERSION")}}}))?;
+    wait(1)?;
+    send(json!({"jsonrpc": "2.0", "method": "initialized"}))?;
+    // One key per attempt: a retried request cannot spend a second credit.
+    send(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimitResetCredit/consume",
+        "params": {"idempotencyKey": idempotency_key()?}}),
+    )?;
+    wait(2)
+}
+
+/// A random UUID (v4) for the reset request.
+fn idempotency_key() -> Result<String, String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +146,13 @@ mod tests {
         assert_eq!(u.windows[1].label, "7d");
         assert!(u.spend.used.is_none());
         assert!(u.spend.reason.is_some());
+    }
+    #[test]
+    fn reset_keys_are_fresh_uuids() {
+        let (a, b) = (idempotency_key().unwrap(), idempotency_key().unwrap());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
     }
     #[test]
     fn missing_usage_is_not_zero() {

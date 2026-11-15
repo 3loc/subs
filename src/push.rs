@@ -86,24 +86,38 @@ fn start_with_t3(
     if crate::demo::on() {
         return crate::demo::start(tx);
     }
+    // Hosts come up to at least this machine's CLI along with its login.
+    let want = crate::update::local(p);
     for (i, host) in hosts.iter().enumerate() {
-        let (host, blob, tx) = (host.clone(), blob.clone(), tx.clone());
+        let (host, blob, tx, want) = (host.clone(), blob.clone(), tx.clone(), want.clone());
         thread::spawn(move || {
             let mut result = push(p, &host, &blob);
+            result = crate::update::after_push(p, &host, want.as_deref(), result);
             if restart_t3 && p == Prov::Claude {
-                if let Done::Ok(message) = &mut result {
-                    result = match ssh(&host, "sh -s", &t3_script(false)) {
-                        Ok(out) => match t3_result(&out) {
-                            Ok(note) => Done::Ok(format!("{message} · {note}")),
-                            Err(e) => Done::Failed(format!("credentials installed; {e}")),
-                        },
-                        Err(_) => Done::Failed("credentials installed; T3 restart failed".into()),
-                    };
-                }
+                result = restart_t3_after(&host, result, "credentials installed");
             }
             let _ = tx.send((i, result));
         });
     }
+}
+
+/// Restart an active T3 on `host` once `done` succeeded; `what` names the
+/// part that still stands when the restart fails.
+pub(crate) fn restart_t3_after(host: &str, done: Done, what: &str) -> Done {
+    let Done::Ok(message) = done else { return done };
+    match ssh(host, "sh -s", &t3_script(false)) {
+        Ok(out) => match t3_result(&out) {
+            Ok(note) => Done::Ok(format!("{message} · {note}")),
+            Err(e) => Done::Failed(format!("{what}; {e}")),
+        },
+        Err(_) => Done::Failed(format!("{what}; T3 restart failed")),
+    }
+}
+
+/// `good`, after scheduling the local T3 restart when asked.
+pub(crate) fn finish_t3(good: bool, restart_t3: bool) -> bool {
+    let local = !restart_t3 || restart_local_t3();
+    good && local
 }
 
 /// Only the explicitly requested, already-active user service is restarted.
@@ -240,6 +254,18 @@ fn keep_theirs(p: Prov, theirs: &Value, ours: &Value) -> bool {
 }
 
 pub(crate) fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
+    exec(host, cmd, input, TIMEOUT, cmd == "sh -s")
+}
+
+/// Run `cmd` on `host` with `input` on its stdin. `secret`: the input holds a
+/// credential, so the remote stderr is never shown.
+pub(crate) fn exec(
+    host: &str,
+    cmd: &str,
+    input: &str,
+    timeout: Duration,
+    secret: bool,
+) -> Result<String, Done> {
     let mut c = Command::new("ssh")
         .env_remove("ANTHROPIC_API_KEY")
         .args([
@@ -278,7 +304,7 @@ pub(crate) fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
         let _ = se.read_to_string(&mut s);
         s
     });
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match c.try_wait() {
             Ok(Some(s)) => break Some(s),
@@ -294,7 +320,7 @@ pub(crate) fn ssh(host: &str, cmd: &str, input: &str) -> Result<String, Done> {
     let out = ro.join().unwrap_or_default();
     let err = re.join().unwrap_or_default();
     // Remote shells may echo stdin on failure. Never surface their credential-bearing output.
-    let last = if cmd == "sh -s" {
+    let last = if secret {
         "remote credential installation failed".to_string()
     } else {
         err.lines()
@@ -468,21 +494,12 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
             p.name(),
             config().display()
         );
-        return !restart_t3 || restart_local_t3();
+        return finish_t3(true, restart_t3);
     }
     let email = if crate::demo::on() {
         crate::demo::ACTIVE.lock().unwrap().to_string()
     } else {
         p.email(&blob).unwrap_or_default()
-    };
-    let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
-        && std::env::var_os("NO_COLOR").is_none();
-    let paint = |code: &str, s: &str| {
-        if color {
-            format!("\x1b[{code}m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
     };
     println!(
         "{}: pushing {email} to {} host{}",
@@ -492,9 +509,36 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
     );
     let (tx, rx) = std::sync::mpsc::channel();
     start_with_t3(p, &hosts, blob, tx, restart_t3);
+    let (ok, off, bad) = wait(&hosts, rx);
+    println!();
+    println!("{}", summary(ok, off.len(), bad, hosts.len()));
+    if !off.is_empty() {
+        println!("offline hosts get it on the next: subs push {}", p.name());
+    }
+    if !restart_t3 && p == Prov::Claude {
+        println!("T3 keeps its environment until restarted · use --restart-t3 to restart active T3 user services");
+    }
+    // Even if one remote failed; only the source restarts here.
+    finish_t3(bad == 0, restart_t3)
+}
+
+/// Print each host's result as it lands, with one live line naming who is
+/// still being waited on. (ok, offline hosts, failed)
+pub(crate) fn wait(
+    hosts: &[String],
+    rx: std::sync::mpsc::Receiver<(usize, Done)>,
+) -> (usize, Vec<String>, usize) {
+    let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, s: &str| {
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
     let w = hosts.iter().map(String::len).max().unwrap_or(0);
     let (mut ok, mut off, mut bad) = (0, vec![], 0);
-    // While hosts answer, one live line names who is still being waited on.
     let live = color && std::io::IsTerminal::is_terminal(&std::io::stdout());
     let spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut waiting: Vec<bool> = vec![true; hosts.len()];
@@ -540,25 +584,15 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
             }
         }
     }
-    println!();
-    println!("{}", summary(ok, off.len(), bad, hosts.len()));
-    if !off.is_empty() {
-        println!("offline hosts get it on the next: subs push {}", p.name());
-    }
-    if restart_t3 {
-        // Do this even if one remote failed; only the source restarts here.
-        let local_ok = restart_local_t3();
-        bad == 0 && local_ok
-    } else {
-        if p == Prov::Claude {
-            println!("T3 keeps its environment until restarted · use --restart-t3 to restart active T3 user services");
-        }
-        bad == 0
-    }
+    (ok, off, bad)
 }
 
 pub fn summary(ok: usize, off: usize, bad: usize, n: usize) -> String {
-    let mut s = format!("pushed to {ok} of {n}");
+    tally("pushed to", ok, off, bad, n)
+}
+
+pub fn tally(verb: &str, ok: usize, off: usize, bad: usize, n: usize) -> String {
+    let mut s = format!("{verb} {ok} of {n}");
     if off > 0 {
         s += &format!(" · {off} offline");
     }

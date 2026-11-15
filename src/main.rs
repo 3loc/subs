@@ -21,6 +21,7 @@ mod push;
 mod status;
 mod store;
 mod tui;
+mod update;
 mod view;
 
 use prov::Prov;
@@ -44,16 +45,23 @@ usage: subs [command]
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
                                           it to your hosts (--local: just this machine;
                                           --oauth: replace a token labelled EMAIL)
-  subs push  codex|claude|cursor          push the active login to your hosts again
+  subs push  codex|claude|cursor          push the active login to your hosts again;
+                                          a push also brings each host's CLI up to
+                                          at least this machine's version
+  subs update [codex|claude|cursor]       update the CLI here to the latest, then
+                                          every host to it (--local: just here)
   subs add   codex|claude|cursor EMAIL    store the account's password
   subs pass  codex|claude|cursor EMAIL    copy (or print) that password
   subs rm    codex|claude|cursor EMAIL    forget an account
+  subs reset codex                        spend one banked full reset on the active
+                                          Codex login (only when a window is used up)
   subs json                               status as JSON
 
 Hosts: one ssh host per line in ~/.config/subs/hosts, optionally followed by
 the providers it takes (\"laptop claude\"). Offline hosts are skipped.
-Claude fanout: --restart-t3 restarts active t3code user services after installation.
-The local restart is scheduled last. This interrupts active T3 runs.";
+Claude fanout and update: --restart-t3 restarts active t3code user services
+after installation, since T3 keeps the credentials and CLI version it saw at
+startup. The local restart is scheduled last. This interrupts active T3 runs.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");
@@ -129,6 +137,23 @@ fn main() {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
+    if cmd == "update" {
+        let provs = match args.first() {
+            None => prov::ALL.to_vec(),
+            Some(a) => match Prov::parse(a) {
+                Some(p) if args.len() == 1 => vec![p],
+                _ => die("usage: subs update [codex|claude|cursor] [--local] [--restart-t3]"),
+            },
+        };
+        let flag = |f: &str| argv.iter().any(|a| a == f);
+        exit(
+            if update::cli(&provs, flag("--local"), flag("--restart-t3")) {
+                0
+            } else {
+                1
+            },
+        );
+    }
     let Some(p) = args.first().and_then(|a| Prov::parse(a)) else {
         die(format!(
             "usage: subs {cmd} codex|claude|cursor EMAIL (subs help)"
@@ -191,6 +216,13 @@ fn main() {
         }
         "push" => return fan(true),
         _ => {}
+    }
+    if cmd == "reset" {
+        if p != Prov::Codex {
+            die("only Codex banks full resets: subs reset codex");
+        }
+        let who = p.read(None).and_then(|b| p.email(&b)).unwrap_or_default();
+        return report(prov::codex::reset().map(|m| format!("codex: {who} {m}")));
     }
     let Some(email) = email else {
         die(format!("usage: subs {cmd} {} EMAIL", p.name()))
