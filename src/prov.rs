@@ -2,7 +2,7 @@
 //! account in it, and asks the provider - not the token - for plan and usage.
 
 pub(crate) mod claude;
-mod codex;
+pub(crate) mod codex;
 pub(crate) mod cursor;
 
 use crate::store::{env_path, home, rjson, wjson};
