@@ -22,6 +22,9 @@ account data or host inventory is part of the build.
 
 ## Use
 
+Agents: read [AGENTS.md](AGENTS.md) first. It covers operating `subs` safely
+and changing this repository.
+
 ```sh
 subs                                    # status of every account
 subs tui                                # interactive view
