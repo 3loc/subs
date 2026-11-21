@@ -16,8 +16,14 @@ git clone git@github.com:3loc/subs.git && cd subs && make install
 
 Installs to `~/.local/bin/subs` (`make install PREFIX=/usr/local` for system-wide,
 `make uninstall` to remove).
+Use `make` for release binaries: it remaps the build user's home and checkout
+paths to generic locations, including dependency error locations. No local
+account data or host inventory is part of the build.
 
 ## Use
+
+Agents: read [AGENTS.md](AGENTS.md) first. It covers operating `subs` safely
+and changing this repository.
 
 ```sh
 subs                                    # status of every account
@@ -25,6 +31,10 @@ subs tui                                # interactive view
 subs login codex|claude|cursor [EMAIL]  # sign in; --use makes it active and pushes it
                                         # (signing in as the active account always does)
 subs login claude EMAIL --token         # long-lived Claude token via the browser, checked
+subs login claude EMAIL --token --use --restart-t3
+                                        # all of it: sign in, push everywhere, restart T3,
+                                        # and prove Claude answers on every machine
+subs check claude                       # prove the token works here and on every host
 subs label claude EMAIL                 # name the installed token's account
 subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
 subs push codex|claude|cursor           # push the active login to your hosts again
@@ -42,6 +52,58 @@ TUI keys: `j`/`k` move, `enter` use (and push), `f` push again, `l` login, `n` n
 `t` long-lived Claude token for the account, `a` password, `p` copy password,
 `d` delete, `r` refresh, `q` quit. On a `[token]` card, `l` creates a new token
 for it; the new token goes out to your hosts once checked and installed.
+
+## Switch Claude everywhere
+
+One command signs in to a Claude account and puts it on every machine and every
+T3 server:
+
+```sh
+subs login claude you@example.com --token --use --restart-t3
+```
+
+It creates a long-lived subscription token in the browser, checks it with one
+small request, installs it here, pushes it to every host (bringing each host's
+`claude` up to this machine's version), restarts the active T3 servers, and then
+proves it took: on each machine, a fresh shell asks Claude for one short reply
+with the new token, and each running T3 server must have been started with that
+same token. Each host's line ends with `Claude replies · T3 has the token`, or
+with what failed. The exit status is nonzero when a reachable machine fails.
+
+This machine goes last. Run from a terminal, its T3 restarts and is checked
+like the hosts. Run from inside T3 (an agent or a T3 terminal: `T3CODE_HOME` is
+set), restarting now would end the command with it, so it checks Claude here,
+schedules the restart for five seconds later, and exits. Once T3 is back:
+
+```sh
+subs check claude
+```
+
+`subs check claude` changes nothing. It makes the same check here and on every
+host, one small request each, and reports T3 servers still running an older
+token, a host with a different token, a rejected token, or a usage limit. Here
+it also makes one small Fable request and shows the account's limits
+(`7d 3% used · Fable 7d 2% used`), which the token's card then keeps.
+`--local` checks only this machine. Only the managed setup-token is checked: a
+request with a shared OAuth login could refresh, and so rotate, it. A plain
+`subs push claude` of a token checks each host too, but only notes a T3 that
+still has the older token, since it was not asked to restart it.
+
+### From an agent
+
+Without a terminal, `--code-file=PATH` waits for the sign-in page's code to
+appear in that file, reads it once and removes it. The path must not exist yet.
+
+```sh
+subs login claude you@example.com --token --code-file="$PWD/claude-code" \
+  --use --restart-t3 > login.log 2>&1 &
+# login.log shows the sign-in link; open it and sign in as that account.
+# Put the code the page shows into place in one step:
+cat /private/code-from-the-user > claude-code.part && mv claude-code.part claude-code
+wait
+```
+
+The link goes to stderr, the code never does; nothing in the log is secret.
 
 ## Hosts
 
@@ -66,7 +128,7 @@ but its live credential was cleared. A revoked saved login still needs a fresh
 browser sign-in; restoring the file cannot make a revoked token valid again.
 
 T3 can retain a previous Claude token in its process environment. To restart
-active `t3code.service` systemd user services after installing Claude credentials:
+active T3 services after installing Claude credentials:
 
 ```sh
 subs use claude you@example.com --restart-t3
@@ -76,15 +138,41 @@ subs login claude you@example.com --use --restart-t3
 
 This is opt-in because it interrupts active T3 runs. Remote services restart
 only after their credential installation succeeds; an inactive service stays
-inactive. The source machine schedules its restart five seconds after fanout
-finishes, so a push launched inside T3 can finish first. Output distinguishes
-restarted, scheduled, skipped, and failed restarts. A restart failure returns a
-nonzero exit status even when the credentials were installed. Hosts without
-systemd user services are skipped. This option is for CLI Claude fanout and
+inactive. The source machine restarts last. For a setup-token outside T3 it
+restarts at once and is checked; inside T3, and for OAuth logins, it is
+scheduled five seconds after fanout finishes, so a push launched inside T3 can
+finish first. Output distinguishes restarted, scheduled, skipped, and failed
+restarts. A restart failure returns a
+nonzero exit status even when the credentials were installed. This option is for CLI Claude fanout and
 cannot be combined with `--local`; normal pushes and the TUI do not restart T3.
 
-For setup-tokens, the T3 service must already source the managed
-`claude-shell.sh` hook at startup; restarting does not rewrite T3 configuration.
+On Linux, this handles the `t3code.service` systemd user service. Its `ExecStart`
+must source the managed `subs/claude-shell.sh` hook before executing T3; a missing
+hook is reported as a failure rather than claiming a restart repaired the login.
+Keep the service's existing executable, arguments and environment. For example,
+the shell portion of its `ExecStart` can look like this (systemd doubles literal
+dollar signs):
+
+```ini
+ExecStart=/bin/sh -c '. "$${XDG_CONFIG_HOME:-$$HOME/.config}/subs/claude-shell.sh"; exec /absolute/path/to/t3 serve --host 127.0.0.1 --port 3773 --no-browser'
+```
+
+On macOS, Python 3 and `launchctl` are needed. `subs` discovers running T3
+servers from the receiving user's `~/Library/LaunchAgents/*.plist`; no machine
+names or service labels are built in. It preserves each server's executable,
+arguments and preferences, adding the managed hook if needed. Tokens are read
+from private configuration at startup, never written into a plist. Changed jobs
+are unloaded and reloaded, with bounded retries while launchd removes the old
+job; later reloads use `kickstart`. Inactive jobs are left alone. A local reload
+is scheduled through launchd after the same five-second delay. Platforms with
+neither supported service manager are reported as skipped.
+
+Checkpoint running agents before opting into a restart. Files and independent
+jobs survive; commands owned by a T3 process may need to run again. A confirmed
+service restart does not prove the app has finished database migrations; the
+setup-token check proves a fresh request works and that T3 started with the
+token. Check the T3 connection before resuming unfinished work. Do not repeat
+completed tasks just because their earlier failure notices remain visible.
 
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.
@@ -113,6 +201,12 @@ startup, so it still says "Update Claude Code" until restarted;
 
 ## Claude setup-token
 
+Normal OAuth access tokens are short-lived and should renew automatically; a
+manual browser login every few hours is not the intended workflow. Copying the
+same access/refresh credential to several machines can break that renewal when
+one machine rotates the shared refresh token. Restoring an expired saved copy
+does not fix a provider-rejected refresh token.
+
 Use a long-lived subscription token when copying the normal OAuth login means
 frequent reauthentication. `subs` creates one with Claude's own browser flow
 and remembers which account you signed in with:
@@ -120,6 +214,20 @@ and remembers which account you signed in with:
 ```sh
 subs login claude you@example.com --token
 ```
+
+For unattended agents across several machines, the complete flow is:
+
+```sh
+subs login claude you@example.com --token --use --restart-t3
+```
+
+This uses the same subscription and OAuth authorization, generating the
+long-lived model-only token rather than sharing a rotating browser login. It
+checks the new token, installs it privately, pushes it to configured hosts and
+reloads supported active T3 services. With no T3 sessions to reload, omit
+`--restart-t3`. If the token is already installed, use
+`subs push claude --restart-t3` after checkpointing agents instead of logging in
+again. No account, host inventory or credential belongs in this repository.
 
 `subs` runs `claude setup-token` on a private terminal in a throwaway config
 and shows only its sign-in link. Open it, sign in as that account, and paste
@@ -241,9 +349,15 @@ Status cards (including the TUI) show spend when the provider reports an amount.
 With a configured setup-token selected, saved OAuth logins with unavailable
 usage are shown as inactive. They do not describe the active token's health.
 `setup-token: configured` means the local token file passed format and permission
-checks; it does not claim a provider verification. Account identity and usage
-reporting are unsupported by this token. JSON uses `usage_status` values
-`available`, `unsupported`, `inactive`, or `error`. Unsupported token usage and
+checks; it does not claim a provider verification. The token cannot report its
+account or usage, and status never makes a model request. But Claude Code
+reports the account's limits with every request. So `subs check claude` makes
+one small Fable request here and keeps those limits for the token's card,
+marked with when they were seen. They are the 7-day window and each model's own
+window, such as `Fable 7d`. A model can be used up while the 5h and 7d windows
+are fine, so each model's window is listed separately, also for OAuth logins.
+JSON uses `usage_status` values `available`, `observed` (with `observed_at`),
+`unsupported`, `inactive`, or `error`. Unsupported token usage and
 inactive OAuth logins have no `err` field; saved-login diagnostics are available
 as `inactive_reason`. The token metadata keeps the `unverified` state and unknown
 validity until a real provider check is performed. Token file failures and

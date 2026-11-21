@@ -27,6 +27,18 @@ impl std::fmt::Debug for Token {
     }
 }
 
+impl Token {
+    /// `cat > FILE` of the token, for a script that compares against it.
+    pub(crate) fn heredoc(&self, file: &str) -> String {
+        crate::push::heredoc(file, &self.value)
+    }
+
+    /// The account the user labelled the token with.
+    pub(crate) fn email(&self) -> Option<&str> {
+        self.account_email.as_deref()
+    }
+}
+
 pub(crate) fn token_path() -> PathBuf {
     env_path("XDG_CONFIG_HOME")
         .unwrap_or_else(|| home().join(".config"))
@@ -403,16 +415,38 @@ enum Input {
     Fail(String),
 }
 
+/// Where the code from the sign-in page comes from.
+pub(crate) enum Code {
+    /// A hidden prompt on the terminal.
+    Prompt,
+    /// One line on stdin.
+    Stdin,
+    /// A file that appears at this path once the user has signed in: how an
+    /// agent hands over the code without a terminal. It is read once and removed.
+    File(PathBuf),
+}
+
 /// Create a long-lived token with Claude's own `claude setup-token` browser flow.
 /// It runs on a private terminal in a throwaway config: only the sign-in link is
 /// shown, and the token replaces nothing until it has answered a real request.
-/// The code from the sign-in page is read hidden when `prompt`, else as one line
-/// on stdin. A model-only token cannot name its account: `email` is the label.
-pub(crate) fn login_token(email: Option<&str>, prompt: bool) -> Result<String, String> {
+/// A model-only token cannot name its account: `email` is the label.
+pub(crate) fn login_token(email: Option<&str>, code: Code) -> Result<String, String> {
     if let Some(email) = email {
         validate_email(email)?;
     }
-    let value = scratch(".login-token-", |dir| setup_token(dir, email, prompt))?;
+    if let Code::File(path) = &code {
+        // A leftover would be taken as this sign-in's code; never delete it for the user.
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(format!(
+                "{} already exists; remove it or name a new path for the code",
+                path.display()
+            ));
+        }
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Err(format!("no directory for the code file {}", path.display()));
+        }
+    }
+    let value = scratch(".login-token-", |dir| setup_token(dir, email, code))?;
     eprintln!("claude: checking the new token with one small request");
     scratch(".login-check-", |dir| check(dir, &value))?;
     install_new(value, email)?;
@@ -434,7 +468,37 @@ fn scratch<T>(prefix: &str, f: impl FnOnce(&Path) -> Result<T, String>) -> Resul
     r
 }
 
-fn setup_token(dir: &Path, email: Option<&str>, prompt: bool) -> Result<String, String> {
+/// Wait for the code file, then take it: once its size has held still, so a
+/// half-written file is not read, and only a private regular file of ours.
+fn code_file(path: &Path, stop: &AtomicBool) -> Option<Input> {
+    let mut seen = None;
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(250));
+        let Ok(m) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !m.is_file() || m.uid() != unsafe { libc::getuid() } {
+            return Some(Input::Fail(format!(
+                "{} is not a regular file of yours; the current login is unchanged",
+                path.display()
+            )));
+        }
+        if m.len() == 0 || seen != Some(m.len()) {
+            seen = Some(m.len());
+            continue;
+        }
+        let mut s = String::new();
+        let read = fs::File::open(path).and_then(|f| f.take(4096).read_to_string(&mut s));
+        let _ = fs::remove_file(path);
+        return Some(match read {
+            Ok(_) => Input::Code(s),
+            Err(_) => Input::Fail(format!("cannot read {}", path.display())),
+        });
+    }
+    None
+}
+
+fn setup_token(dir: &Path, email: Option<&str>, code: Code) -> Result<String, String> {
     let mut cmd = login_command();
     cmd.arg("setup-token")
         .env("CLAUDE_CONFIG_DIR", dir)
@@ -462,34 +526,50 @@ fn setup_token(dir: &Path, email: Option<&str>, prompt: bool) -> Result<String, 
     eprintln!("claude: open this link and sign in{who} to create a long-lived subscription token:\n\n{url}\n");
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = if prompt {
-        eprintln!(
-            "then paste the code the page shows; a browser on this machine finishes by itself"
-        );
-        let stop = stop.clone();
-        Some(thread::spawn(move || {
-            let r = crate::actions::read_secret_until("code (hidden): ", &|| {
-                stop.load(Ordering::Relaxed)
+    let reader = match code {
+        Code::Prompt => {
+            eprintln!(
+                "then paste the code the page shows; a browser on this machine finishes by itself"
+            );
+            let stop = stop.clone();
+            Some(thread::spawn(move || {
+                let r = crate::actions::read_secret_until("code (hidden): ", &|| {
+                    stop.load(Ordering::Relaxed)
+                });
+                let _ = tx.send(match r {
+                    Ok(Some(code)) => Input::Code(code),
+                    Ok(None) => return,
+                    Err(e) => Input::Fail(e),
+                });
+            }))
+        }
+        Code::File(path) => {
+            eprintln!(
+                "then write the code the page shows to {}; it is read once and removed",
+                path.display()
+            );
+            let stop = stop.clone();
+            Some(thread::spawn(move || {
+                if let Some(i) = code_file(&path, &stop) {
+                    let _ = tx.send(i);
+                }
+            }))
+        }
+        Code::Stdin => {
+            eprintln!("then send the code the page shows as one line on stdin");
+            thread::spawn(move || {
+                let mut s = String::new();
+                let read = io::stdin().lock().take(4096).read_line(&mut s);
+                let _ = tx.send(match read {
+                    Ok(n) if n > 0 => Input::Code(s),
+                    _ => Input::Fail(
+                        "stdin closed before the code arrived; the current login is unchanged"
+                            .into(),
+                    ),
+                });
             });
-            let _ = tx.send(match r {
-                Ok(Some(code)) => Input::Code(code),
-                Ok(None) => return,
-                Err(e) => Input::Fail(e),
-            });
-        }))
-    } else {
-        eprintln!("then send the code the page shows as one line on stdin");
-        thread::spawn(move || {
-            let mut s = String::new();
-            let read = io::stdin().lock().take(4096).read_line(&mut s);
-            let _ = tx.send(match read {
-                Ok(n) if n > 0 => Input::Code(s),
-                _ => Input::Fail(
-                    "stdin closed before the code arrived; the current login is unchanged".into(),
-                ),
-            });
-        });
-        None
+            None
+        }
     };
     let r = wait_token(&mut term, &mut screen, &rx);
     stop.store(true, Ordering::Relaxed);
@@ -646,12 +726,15 @@ fn redact(text: &str, secret: Option<&str>) -> String {
         .join(" ")
 }
 
-/// One small real request with the new token through Claude's own CLI, in a
-/// throwaway config, before the token replaces anything. Only a short,
-/// redacted reason of a failure is shown.
-fn check(dir: &Path, token: &str) -> Result<(), String> {
+/// Run `claude` with `token` alone in a throwaway config: `args`, `prompt` on
+/// stdin. (exit status, stdout, stderr); no status when it timed out.
+fn claude_p(
+    dir: &Path,
+    token: &str,
+    args: &[&str],
+) -> Result<(Option<std::process::ExitStatus>, String, String), &'static str> {
     let mut c = login_command();
-    c.args(["-p", "--model", "haiku"])
+    c.args(args)
         .env("CLAUDE_CODE_OAUTH_TOKEN", token)
         .env("CLAUDE_CONFIG_DIR", dir)
         .current_dir(dir)
@@ -667,10 +750,7 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
     ] {
         c.env_remove(k);
     }
-    let fail = |why: &str| {
-        format!("the new token failed its check ({why}); nothing was installed, the current login is unchanged")
-    };
-    let mut child = c.spawn().map_err(|_| fail("cannot run claude"))?;
+    let mut child = c.spawn().map_err(|_| "cannot run claude")?;
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(b"Reply with the single word ok.\n");
     }
@@ -678,7 +758,7 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
         thread::spawn(move || {
             let mut s = String::new();
             if let Some(p) = p {
-                let _ = p.take(65536).read_to_string(&mut s);
+                let _ = p.take(1 << 20).read_to_string(&mut s);
             }
             s
         })
@@ -697,6 +777,17 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
         }
     };
     let [out, err] = pipes.map(|h| h.join().unwrap_or_default());
+    Ok((status, out, err))
+}
+
+/// One small real request with the new token through Claude's own CLI, in a
+/// throwaway config, before the token replaces anything. Only a short,
+/// redacted reason of a failure is shown.
+fn check(dir: &Path, token: &str) -> Result<(), String> {
+    let fail = |why: &str| {
+        format!("the new token failed its check ({why}); nothing was installed, the current login is unchanged")
+    };
+    let (status, out, err) = claude_p(dir, token, &["-p", "--model", "haiku"]).map_err(fail)?;
     match status {
         None => Err(fail("timed out")),
         Some(s) if s.success() && !out.trim().is_empty() => Ok(()),
@@ -713,6 +804,118 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
     }
 }
 
+/// A usage window's key, as Claude names it, to a card label. Model limits
+/// are their own windows: a model can be used up while the 5h and 7d are fine.
+fn window_label(key: &str) -> Option<String> {
+    Some(match key {
+        "five_hour" => "5h".into(),
+        "seven_day" => "7d".into(),
+        // Claude's CLI calls this one the Fable limit.
+        "seven_day_overage_included" => "Fable 7d".into(),
+        k => {
+            let model = k.strip_prefix("seven_day_")?;
+            let mut c = model.chars();
+            let first = c.next()?.to_uppercase().collect::<String>();
+            format!("{first}{} 7d", c.as_str().replace('_', " "))
+        }
+    })
+}
+
+/// Windows in a fixed order: 5h, 7d, then each model's.
+fn windows(u: &Value, pct: f64, used: &str, reset: fn(&Value) -> Option<f64>) -> Vec<Win> {
+    let Some(m) = u.as_object() else {
+        return vec![];
+    };
+    let mut keys: Vec<&String> = m.keys().filter(|k| m[*k].is_object()).collect();
+    keys.sort_by_key(|k| match k.as_str() {
+        "five_hour" => 0,
+        "seven_day" => 1,
+        _ => 2,
+    });
+    keys.into_iter()
+        .filter_map(|k| {
+            let w = &m[k];
+            let label = window_label(k)?;
+            Some(Win {
+                label,
+                pct: w[used].as_f64().map(|v| v * pct),
+                reset: reset(w),
+            })
+        })
+        .collect()
+}
+
+/// Where the last limits a check saw for the setup-token are kept. A dot
+/// name, so it is never listed as a saved login.
+fn observed_path() -> PathBuf {
+    store::root().join("claude/.token-usage.json")
+}
+
+/// One small Fable request with the token, reading the limits Claude Code
+/// reports with it, and keep them for the token's card. A Fable request is the
+/// one that also reports the Fable window. Nothing else is kept.
+pub(crate) fn observe(token: &Token) -> Result<Vec<Win>, String> {
+    let args = [
+        "-p",
+        "--tools",
+        "",
+        "--model",
+        "fable",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ];
+    let (_, out, _) = scratch(".login-usage-", |dir| {
+        claude_p(dir, &token.value, &args).map_err(String::from)
+    })?;
+    let info = out
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["type"] == "rate_limit_event")
+        .map(|e| e["rate_limit_info"].clone())
+        .ok_or("Claude reported no limits")?;
+    let keep = json!({"token_id": token_id(&token.value), "observed_at": store::now(),
+        "windows": info["unifiedWindows"], "status": info["status"]});
+    store::wjson(&observed_path(), &keep).map_err(|e| e.to_string())?;
+    Ok(observed_windows(&keep))
+}
+
+fn observed_windows(keep: &Value) -> Vec<Win> {
+    windows(&keep["windows"], 100.0, "utilization", |w| {
+        w["resetsAt"].as_f64()
+    })
+}
+
+/// The limits the last check saw for the installed token, and when.
+pub(crate) fn observed() -> Option<(Usage, f64)> {
+    let token = load_token().ok()??;
+    let keep = store::rjson(&observed_path())?;
+    if keep["token_id"].as_str() != Some(token_id(&token.value).as_str()) {
+        return None;
+    }
+    let at = keep["observed_at"].as_f64()?;
+    let windows = observed_windows(&keep);
+    let limited = keep["status"] == "rejected"
+        || keep["windows"]
+            .as_object()
+            .is_some_and(|m| m.values().any(|w| w["status"] == "rejected"))
+        || windows.iter().any(|w| w.pct.unwrap_or(0.0) >= 100.0);
+    Some((
+        Usage {
+            spend: Spend::unknown("flat subscription; dollar spend not exposed"),
+            plan: None,
+            windows,
+            resets: None,
+            extra: None,
+            limited,
+        },
+        at,
+    ))
+}
+
 pub(super) fn usage(blob: &Value) -> Result<Usage, String> {
     let o = &blob["credentials"]["claudeAiOauth"];
     let token = o["accessToken"].as_str().ok_or("no access token")?;
@@ -724,15 +927,9 @@ pub(super) fn usage(blob: &Value) -> Result<Usage, String> {
 }
 
 fn parse(u: &Value, o: &Value) -> Result<Usage, String> {
-    let windows: Vec<Win> = [("five_hour", "5h"), ("seven_day", "7d")]
-        .iter()
-        .filter(|(k, _)| u[*k].is_object())
-        .map(|(k, label)| Win {
-            label: label.to_string(),
-            pct: u[*k]["utilization"].as_f64(),
-            reset: u[*k]["resets_at"].as_str().and_then(iso),
-        })
-        .collect();
+    let windows = windows(u, 1.0, "utilization", |w| {
+        w["resets_at"].as_str().and_then(iso)
+    });
     let x = &u["extra_usage"];
     let extra = (x["is_enabled"].as_bool() == Some(true)).then(|| {
         match (x["used_credits"].as_f64(), x["monthly_limit"].as_f64()) {
@@ -1110,6 +1307,32 @@ mod tests {
         assert!(u.limited);
         assert!(u.spend.used.is_none());
         assert_eq!(u.extra.as_deref(), Some("extra credits 123/1000"));
+    }
+    #[test]
+    fn each_model_limit_is_its_own_window() {
+        assert_eq!(
+            window_label("seven_day_overage_included").as_deref(),
+            Some("Fable 7d")
+        );
+        assert_eq!(window_label("seven_day_opus").as_deref(), Some("Opus 7d"));
+        assert_eq!(window_label("extra_usage"), None);
+        // The usage endpoint, in percent.
+        let u = parse(
+            &json!({"seven_day_opus":{"utilization":12},"seven_day":{"utilization":3},"five_hour":{"utilization":1},"extra_usage":{"is_enabled":false}}),
+            &json!({}),
+        )
+        .unwrap();
+        let labels: Vec<&str> = u.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5h", "7d", "Opus 7d"]);
+        // What Claude Code reports with a Fable request, as a fraction.
+        let seen = observed_windows(&json!({"windows": {
+            "seven_day_overage_included": {"utilization": 1.0, "resetsAt": 1795654800.0, "status": "rejected"},
+            "seven_day": {"utilization": 0.02, "resetsAt": 1795654800.0, "status": "allowed"}}}));
+        assert_eq!(seen[0].label, "7d");
+        assert_eq!(seen[0].pct, Some(2.0));
+        assert_eq!(seen[1].label, "Fable 7d");
+        assert_eq!(seen[1].pct, Some(100.0));
+        assert_eq!(seen[1].reset, Some(1795654800.0));
     }
     #[test]
     fn unknown_extra_credits_stay_unknown() {
