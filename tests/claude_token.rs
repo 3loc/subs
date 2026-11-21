@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const FAKE: &str = "sk-ant-oat01-FAKE-integration-test-only";
 const CHECK_ONLY: &str = r#"test "${ANTHROPIC_API_KEY+x}" != x
 case "$*" in
+  '-p --tools  --model fable --strict-mcp-config --no-session-persistence --output-format stream-json --verbose')
+    test "$CLAUDE_CODE_OAUTH_TOKEN" = sk-ant-oat01-FAKE-integration-test-only || exit 7
+    test -f "$TEST_REMOTE_HOME/../limits" || exit 1
+    cat "$TEST_REMOTE_HOME/../limits" ;;
   '-p --tools  --model haiku --strict-mcp-config --no-session-persistence')
     test "$CLAUDE_CODE_OAUTH_TOKEN" = sk-ant-oat01-FAKE-integration-test-only || exit 7
     case "$(cat)" in *ok*) printf 'ok\n';; *) exit 5;; esac ;;
@@ -1291,4 +1295,53 @@ fn code_file_hands_over_the_sign_in_code_without_a_terminal() {
     assert!(!code.exists(), "the code is removed once read");
     assert!(fs::read_to_string(f.env_path()).unwrap().contains(FAKE));
     no_leftovers(&f);
+}
+
+#[test]
+fn check_keeps_the_fable_limit_for_the_token_card() {
+    let f = Fixture::new();
+    f.install();
+    // Before any check, a token's usage is unknown.
+    assert_eq!(token_row(&f.json())["usage_status"], "unsupported");
+    fs::write(
+        f.0.join("limits"),
+        r#"{"type":"system","subtype":"init","model":"claude-fable-5-2"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800,"rateLimitType":"seven_day_overage_included","unifiedWindows":{"seven_day":{"utilization":0.02,"resetsAt":4102444800,"status":"allowed"},"seven_day_overage_included":{"utilization":1.0,"resetsAt":4102444800,"status":"rejected"}}}}
+{"type":"result","is_error":true,"result":"You've hit your Fable limit"}
+"#,
+    )
+    .unwrap();
+    let out = f.run(&["check", "claude", "--local"], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("7d 2% used · Fable 7d used up, resets in"),
+        "{text}"
+    );
+    let v = f.json();
+    let r = token_row(&v);
+    assert_eq!(r["usage_status"], "observed");
+    assert_eq!(r["limited"], true);
+    assert_eq!(r["windows"][1][0], "Fable 7d");
+    assert_eq!(r["windows"][1][1], 100.0);
+    let text = String::from_utf8_lossy(&f.run(&["status"], "").stdout).to_string();
+    assert!(
+        text.contains("Fable 7d") && text.contains("seen 0m ago by subs check claude"),
+        "{text}"
+    );
+    // The record is not an account, and a new token does not inherit it.
+    assert_eq!(
+        v.as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["provider"] == "claude")
+            .count(),
+        1
+    );
+    let other = format!("{}\n", FAKE.replace("FAKE", "OTHER"));
+    assert!(f
+        .run(&["login", "claude", "--token"], &other)
+        .status
+        .success());
+    assert_eq!(token_row(&f.json())["usage_status"], "unsupported");
 }

@@ -171,16 +171,38 @@ pub fn host(host: &str, t3: T3, fresh: bool) -> Done {
     }
 }
 
-/// Check this machine.
+/// Check this machine, then record the account's limits for its card.
 pub fn here(t3: T3, fresh: bool) -> Done {
     let token = match token() {
         Ok(t) => t,
         Err(e) => return Done::Failed(e),
     };
-    match push::exec_here(&script(&token, t3, fresh), TIMEOUT) {
+    let done = match push::exec_here(&script(&token, t3, fresh), TIMEOUT) {
         Ok(out) => read(&out, t3),
         Err(d) => d,
+    };
+    let Done::Ok(m) = done else { return done };
+    match claude::observe(&token) {
+        Ok(w) if !w.is_empty() => Done::Ok(format!("{m} · {}", limits(&w))),
+        // The machine works; only the limits are unknown.
+        _ => Done::Ok(format!("{m} · limits not reported")),
     }
+}
+
+/// "7d 2% used · Fable 7d 0% used", and a used-up window first.
+fn limits(w: &[crate::prov::Win]) -> String {
+    w.iter()
+        .map(|w| match w.pct {
+            Some(p) if p >= 100.0 => format!(
+                "{} used up, resets in {}",
+                w.label,
+                w.reset.map_or("?".into(), crate::status::until)
+            ),
+            Some(p) => format!("{} {p:.0}% used", w.label),
+            None => format!("{} unknown", w.label),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// After a push to `host` succeeded, prove it took.

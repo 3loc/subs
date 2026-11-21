@@ -8,6 +8,8 @@ use std::thread;
 
 pub enum UsageState {
     Available(Usage),
+    /// A setup-token's limits as `subs check claude` last saw them, and when.
+    Observed(Usage, f64),
     Unsupported,
     InactiveOAuth(String),
     Error(String),
@@ -16,7 +18,7 @@ pub enum UsageState {
 impl UsageState {
     pub fn reported(&self) -> Option<&Usage> {
         match self {
-            Self::Available(u) => Some(u),
+            Self::Available(u) | Self::Observed(u, _) => Some(u),
             _ => None,
         }
     }
@@ -112,7 +114,10 @@ pub fn status() -> Vec<Row> {
             active: token["state"] == "unverified",
             password,
             usage: if token["state"] == "unverified" {
-                UsageState::Unsupported
+                match crate::prov::claude::observed() {
+                    Some((u, at)) => UsageState::Observed(u, at),
+                    None => UsageState::Unsupported,
+                }
             } else {
                 UsageState::Error(
                     token["error"]
@@ -157,7 +162,15 @@ fn fetch(p: Prov, blob: &Value, active: bool) -> Result<Usage, String> {
 
 /// Time until `t`: 41m, 2h 14m, 3d 4h.
 pub fn until(t: f64) -> String {
-    let s = (t - now()).max(0.0) as u64;
+    length((t - now()).max(0.0) as u64)
+}
+
+/// Time since `t`, the same way.
+pub fn ago(t: f64) -> String {
+    length((now() - t).max(0.0) as u64)
+}
+
+fn length(s: u64) -> String {
     let (big, small) = match s {
         86400.. => ((s / 86400, "d"), (s % 86400 / 3600, "h")),
         3600.. => ((s / 3600, "h"), (s % 3600 / 60, "m")),
@@ -191,6 +204,13 @@ pub fn to_json(rows: &[Row]) -> Value {
                     o["windows"] = Value::Null;
                     o["spend"] = crate::prov::Spend::unknown("saved OAuth login is inactive").json();
                 },
+                UsageState::Observed(u, at) => {
+                    o["usage_status"] = json!("observed");
+                    o["observed_at"] = json!(at);
+                    o["spend"] = u.spend.json();
+                    o["windows"] = u.windows.iter().map(|w| json!([w.label, w.pct, w.reset])).collect();
+                    o["limited"] = json!(u.limited);
+                }
                 UsageState::Available(u) => {
                     o["usage_status"] = json!("available");
                     o["plan"] = json!(u.plan);

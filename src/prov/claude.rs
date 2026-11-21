@@ -726,12 +726,15 @@ fn redact(text: &str, secret: Option<&str>) -> String {
         .join(" ")
 }
 
-/// One small real request with the new token through Claude's own CLI, in a
-/// throwaway config, before the token replaces anything. Only a short,
-/// redacted reason of a failure is shown.
-fn check(dir: &Path, token: &str) -> Result<(), String> {
+/// Run `claude` with `token` alone in a throwaway config: `args`, `prompt` on
+/// stdin. (exit status, stdout, stderr); no status when it timed out.
+fn claude_p(
+    dir: &Path,
+    token: &str,
+    args: &[&str],
+) -> Result<(Option<std::process::ExitStatus>, String, String), &'static str> {
     let mut c = login_command();
-    c.args(["-p", "--model", "haiku"])
+    c.args(args)
         .env("CLAUDE_CODE_OAUTH_TOKEN", token)
         .env("CLAUDE_CONFIG_DIR", dir)
         .current_dir(dir)
@@ -747,10 +750,7 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
     ] {
         c.env_remove(k);
     }
-    let fail = |why: &str| {
-        format!("the new token failed its check ({why}); nothing was installed, the current login is unchanged")
-    };
-    let mut child = c.spawn().map_err(|_| fail("cannot run claude"))?;
+    let mut child = c.spawn().map_err(|_| "cannot run claude")?;
     if let Some(mut i) = child.stdin.take() {
         let _ = i.write_all(b"Reply with the single word ok.\n");
     }
@@ -758,7 +758,7 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
         thread::spawn(move || {
             let mut s = String::new();
             if let Some(p) = p {
-                let _ = p.take(65536).read_to_string(&mut s);
+                let _ = p.take(1 << 20).read_to_string(&mut s);
             }
             s
         })
@@ -777,6 +777,17 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
         }
     };
     let [out, err] = pipes.map(|h| h.join().unwrap_or_default());
+    Ok((status, out, err))
+}
+
+/// One small real request with the new token through Claude's own CLI, in a
+/// throwaway config, before the token replaces anything. Only a short,
+/// redacted reason of a failure is shown.
+fn check(dir: &Path, token: &str) -> Result<(), String> {
+    let fail = |why: &str| {
+        format!("the new token failed its check ({why}); nothing was installed, the current login is unchanged")
+    };
+    let (status, out, err) = claude_p(dir, token, &["-p", "--model", "haiku"]).map_err(fail)?;
     match status {
         None => Err(fail("timed out")),
         Some(s) if s.success() && !out.trim().is_empty() => Ok(()),
@@ -793,6 +804,118 @@ fn check(dir: &Path, token: &str) -> Result<(), String> {
     }
 }
 
+/// A usage window's key, as Claude names it, to a card label. Model limits
+/// are their own windows: a model can be used up while the 5h and 7d are fine.
+fn window_label(key: &str) -> Option<String> {
+    Some(match key {
+        "five_hour" => "5h".into(),
+        "seven_day" => "7d".into(),
+        // Claude's CLI calls this one the Fable limit.
+        "seven_day_overage_included" => "Fable 7d".into(),
+        k => {
+            let model = k.strip_prefix("seven_day_")?;
+            let mut c = model.chars();
+            let first = c.next()?.to_uppercase().collect::<String>();
+            format!("{first}{} 7d", c.as_str().replace('_', " "))
+        }
+    })
+}
+
+/// Windows in a fixed order: 5h, 7d, then each model's.
+fn windows(u: &Value, pct: f64, used: &str, reset: fn(&Value) -> Option<f64>) -> Vec<Win> {
+    let Some(m) = u.as_object() else {
+        return vec![];
+    };
+    let mut keys: Vec<&String> = m.keys().filter(|k| m[*k].is_object()).collect();
+    keys.sort_by_key(|k| match k.as_str() {
+        "five_hour" => 0,
+        "seven_day" => 1,
+        _ => 2,
+    });
+    keys.into_iter()
+        .filter_map(|k| {
+            let w = &m[k];
+            let label = window_label(k)?;
+            Some(Win {
+                label,
+                pct: w[used].as_f64().map(|v| v * pct),
+                reset: reset(w),
+            })
+        })
+        .collect()
+}
+
+/// Where the last limits a check saw for the setup-token are kept. A dot
+/// name, so it is never listed as a saved login.
+fn observed_path() -> PathBuf {
+    store::root().join("claude/.token-usage.json")
+}
+
+/// One small Fable request with the token, reading the limits Claude Code
+/// reports with it, and keep them for the token's card. A Fable request is the
+/// one that also reports the Fable window. Nothing else is kept.
+pub(crate) fn observe(token: &Token) -> Result<Vec<Win>, String> {
+    let args = [
+        "-p",
+        "--tools",
+        "",
+        "--model",
+        "fable",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ];
+    let (_, out, _) = scratch(".login-usage-", |dir| {
+        claude_p(dir, &token.value, &args).map_err(String::from)
+    })?;
+    let info = out
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|e| e["type"] == "rate_limit_event")
+        .map(|e| e["rate_limit_info"].clone())
+        .ok_or("Claude reported no limits")?;
+    let keep = json!({"token_id": token_id(&token.value), "observed_at": store::now(),
+        "windows": info["unifiedWindows"], "status": info["status"]});
+    store::wjson(&observed_path(), &keep).map_err(|e| e.to_string())?;
+    Ok(observed_windows(&keep))
+}
+
+fn observed_windows(keep: &Value) -> Vec<Win> {
+    windows(&keep["windows"], 100.0, "utilization", |w| {
+        w["resetsAt"].as_f64()
+    })
+}
+
+/// The limits the last check saw for the installed token, and when.
+pub(crate) fn observed() -> Option<(Usage, f64)> {
+    let token = load_token().ok()??;
+    let keep = store::rjson(&observed_path())?;
+    if keep["token_id"].as_str() != Some(token_id(&token.value).as_str()) {
+        return None;
+    }
+    let at = keep["observed_at"].as_f64()?;
+    let windows = observed_windows(&keep);
+    let limited = keep["status"] == "rejected"
+        || keep["windows"]
+            .as_object()
+            .is_some_and(|m| m.values().any(|w| w["status"] == "rejected"))
+        || windows.iter().any(|w| w.pct.unwrap_or(0.0) >= 100.0);
+    Some((
+        Usage {
+            spend: Spend::unknown("flat subscription; dollar spend not exposed"),
+            plan: None,
+            windows,
+            resets: None,
+            extra: None,
+            limited,
+        },
+        at,
+    ))
+}
+
 pub(super) fn usage(blob: &Value) -> Result<Usage, String> {
     let o = &blob["credentials"]["claudeAiOauth"];
     let token = o["accessToken"].as_str().ok_or("no access token")?;
@@ -804,15 +927,9 @@ pub(super) fn usage(blob: &Value) -> Result<Usage, String> {
 }
 
 fn parse(u: &Value, o: &Value) -> Result<Usage, String> {
-    let windows: Vec<Win> = [("five_hour", "5h"), ("seven_day", "7d")]
-        .iter()
-        .filter(|(k, _)| u[*k].is_object())
-        .map(|(k, label)| Win {
-            label: label.to_string(),
-            pct: u[*k]["utilization"].as_f64(),
-            reset: u[*k]["resets_at"].as_str().and_then(iso),
-        })
-        .collect();
+    let windows = windows(u, 1.0, "utilization", |w| {
+        w["resets_at"].as_str().and_then(iso)
+    });
     let x = &u["extra_usage"];
     let extra = (x["is_enabled"].as_bool() == Some(true)).then(|| {
         match (x["used_credits"].as_f64(), x["monthly_limit"].as_f64()) {
@@ -1190,6 +1307,32 @@ mod tests {
         assert!(u.limited);
         assert!(u.spend.used.is_none());
         assert_eq!(u.extra.as_deref(), Some("extra credits 123/1000"));
+    }
+    #[test]
+    fn each_model_limit_is_its_own_window() {
+        assert_eq!(
+            window_label("seven_day_overage_included").as_deref(),
+            Some("Fable 7d")
+        );
+        assert_eq!(window_label("seven_day_opus").as_deref(), Some("Opus 7d"));
+        assert_eq!(window_label("extra_usage"), None);
+        // The usage endpoint, in percent.
+        let u = parse(
+            &json!({"seven_day_opus":{"utilization":12},"seven_day":{"utilization":3},"five_hour":{"utilization":1},"extra_usage":{"is_enabled":false}}),
+            &json!({}),
+        )
+        .unwrap();
+        let labels: Vec<&str> = u.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["5h", "7d", "Opus 7d"]);
+        // What Claude Code reports with a Fable request, as a fraction.
+        let seen = observed_windows(&json!({"windows": {
+            "seven_day_overage_included": {"utilization": 1.0, "resetsAt": 1795654800.0, "status": "rejected"},
+            "seven_day": {"utilization": 0.02, "resetsAt": 1795654800.0, "status": "allowed"}}}));
+        assert_eq!(seen[0].label, "7d");
+        assert_eq!(seen[0].pct, Some(2.0));
+        assert_eq!(seen[1].label, "Fable 7d");
+        assert_eq!(seen[1].pct, Some(100.0));
+        assert_eq!(seen[1].reset, Some(1795654800.0));
     }
     #[test]
     fn unknown_extra_credits_stay_unknown() {

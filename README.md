@@ -81,7 +81,9 @@ subs check claude
 
 `subs check claude` changes nothing. It makes the same check here and on every
 host, one small request each, and reports T3 servers still running an older
-token, a host with a different token, a rejected token, or a usage limit.
+token, a host with a different token, a rejected token, or a usage limit. Here
+it also makes one small Fable request and shows the account's limits
+(`7d 3% used · Fable 7d 2% used`), which the token's card then keeps.
 `--local` checks only this machine. Only the managed setup-token is checked: a
 request with a shared OAuth login could refresh, and so rotate, it. A plain
 `subs push claude` of a token checks each host too, but only notes a T3 that
@@ -347,9 +349,15 @@ Status cards (including the TUI) show spend when the provider reports an amount.
 With a configured setup-token selected, saved OAuth logins with unavailable
 usage are shown as inactive. They do not describe the active token's health.
 `setup-token: configured` means the local token file passed format and permission
-checks; it does not claim a provider verification. Account identity and usage
-reporting are unsupported by this token. JSON uses `usage_status` values
-`available`, `unsupported`, `inactive`, or `error`. Unsupported token usage and
+checks; it does not claim a provider verification. The token cannot report its
+account or usage, and status never makes a model request. But Claude Code
+reports the account's limits with every request. So `subs check claude` makes
+one small Fable request here and keeps those limits for the token's card,
+marked with when they were seen. They are the 7-day window and each model's own
+window, such as `Fable 7d`. A model can be used up while the 5h and 7d windows
+are fine, so each model's window is listed separately, also for OAuth logins.
+JSON uses `usage_status` values `available`, `observed` (with `observed_at`),
+`unsupported`, `inactive`, or `error`. Unsupported token usage and
 inactive OAuth logins have no `err` field; saved-login diagnostics are available
 as `inactive_reason`. The token metadata keeps the `unverified` state and unknown
 validity until a real provider check is performed. Token file failures and

@@ -19,11 +19,17 @@ cat ~/.config/subs/hosts   # the hosts a push reaches ($SUBS_HOSTS overrides)
 ```
 
 `subs json` rows have `provider`, `email`, `active`, `usage_status`
-(`available`, `unsupported`, `inactive`, `error`), `windows`, `resets` and
-`spend`. `password` is only a yes/no flag. A Claude setup-token row has
-`setup_token`. On that row, `usage_status: unsupported` and `valid: null` are
-normal: the token cannot report usage or its account. An `inactive` saved OAuth
-login beside a working token is not a problem.
+(`available`, `observed`, `unsupported`, `inactive`, `error`), `windows`,
+`resets` and `spend`. `password` is only a yes/no flag. A Claude setup-token
+row has `setup_token`. The token cannot report usage itself: its `windows` are
+what the last `subs check claude` saw (`usage_status: observed`, with
+`observed_at`), or `unsupported` before any check. That is normal, as is
+`valid: null`. An `inactive` saved OAuth login beside a working token is not a
+problem.
+
+Each model's limit is its own window (`Fable 7d`). A thread that says a model
+is blocked may be quoting an old account's limit. Before switching models,
+check the current one: `subs check claude --local` prints the live windows.
 
 `subs check claude` changes nothing. It makes one small Haiku request per
 machine and checks each running T3 server's environment. This is the proof
@@ -90,6 +96,21 @@ always finish first, and the log is complete. Tell the user before
 starting, and keep the log in a file. When they come back, read the log, then
 run `subs check claude`; its exit status 0 means done. Do not repeat the login
 or push just because your turn was cut short. Read the log first.
+
+### After a switch, tell the threads
+
+`subs` changes the machines, not what agents remember. A T3 thread that saw the
+old account's "You've hit your Fable limit · resets …" keeps saying that model
+is blocked and offers other models, even though its new process runs on the new
+account. A switch is done only when the threads know:
+
+- Look through unsettled threads on every T3 environment for pending questions
+  or failures that cite a limit, `blocked until`, `resets` or a sign-in. Answer
+  them with the account now in use and when its T3 restarted. Restate what the
+  user originally asked for; do not choose for them.
+- Resume, once, threads that the restart cut off mid-turn. Leave settled,
+  finished and deliberately stopped ones alone.
+- Prove a model with one tiny request to it, not with the 5h or 7d windows.
 
 ### Read the results
 

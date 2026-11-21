@@ -14,7 +14,7 @@ pub const MUTED: Color = Color::DarkGray;
 /// Widest the card column grows; past this bars stop stretching.
 pub const MAX: usize = 76;
 /// Columns a window line uses besides its bar.
-const FIXED: usize = 41;
+const FIXED: usize = 43;
 
 pub fn span(t: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(t.into(), style)
@@ -159,6 +159,16 @@ fn card(r: &Row, selected: bool, cw: usize, bw: usize) -> Vec<Line<'static>> {
         UsageState::Available(u) => {
             out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw)))
         }
+        UsageState::Observed(u, at) => {
+            out.extend(u.windows.iter().map(|w| window(edge.clone(), w, bw)));
+            out.push(Line::from(vec![
+                edge,
+                muted(format!(
+                    "   seen {} ago by subs check claude",
+                    crate::status::ago(*at)
+                )),
+            ]));
+        }
     }
     if let Some(t) = r.token.as_ref().filter(|t| t["present"] == true) {
         out.push(Line::from(vec![muted(format!(
@@ -243,7 +253,7 @@ fn window(edge: Span<'static>, w: &Win, bw: usize) -> Line<'static> {
     let mut l = vec![
         edge,
         span("   ", Style::new()),
-        muted(format!("{label:<8}")),
+        muted(format!("{label:<10}")),
     ];
     // The bar is a fuel gauge: what is still left, on a track of what is used.
     match w.pct.map(|used| 100.0 - used.clamp(0.0, 100.0)) {

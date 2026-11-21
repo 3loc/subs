@@ -48,8 +48,9 @@ usage: subs [command]
                                           every host, restart T3 everywhere, and prove
                                           Claude answers on each with the new token
   subs check claude                       prove the token works here and on every host:
-                                          one small request each, and T3 started with it
-                                          (--local: just here)
+                                          one small request each, and T3 started with it;
+                                          here it also shows and keeps the account's
+                                          limits, each model's apart (--local: just here)
   subs label claude EMAIL                 name the installed token's account
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
                                           it to your hosts (--local: just this machine;
