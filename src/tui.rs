@@ -542,7 +542,11 @@ pub fn run() -> io::Result<()> {
             println!("\x1b[90mfollow the link, finish in the browser; you come back here when it is done\x1b[0m\n");
             // A token is live once installed, so it goes out at once like a re-login.
             let r = if token {
-                crate::prov::claude::login_token(email.as_deref(), true).map(|msg| actions::Login {
+                crate::prov::claude::login_token(
+                    email.as_deref(),
+                    crate::prov::claude::Code::Prompt,
+                )
+                .map(|msg| actions::Login {
                     email: email.clone().unwrap_or_default(),
                     live: true,
                     msg,

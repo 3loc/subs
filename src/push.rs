@@ -10,6 +10,7 @@
 //! credential in a heredoc, so it never shows up in `ps` and the host needs
 //! nothing but sh. A host that does not answer is offline, not failed.
 
+use crate::check::T3;
 use crate::prov::{claude, Prov};
 use crate::store::{env_path, home};
 use serde_json::{json, Value};
@@ -73,21 +74,24 @@ fn local_names() -> Vec<String> {
 
 /// Push `blob` to every host in parallel; each result goes to `tx` as it lands.
 pub fn start(p: Prov, hosts: &[String], blob: Value, tx: Sender<(usize, Done)>) {
-    start_with_t3(p, hosts, blob, tx, false);
+    start_with_t3(p, hosts, blob, tx, false, false);
 }
 
+/// `verify`: then prove a pushed Claude setup-token works there (check.rs).
 fn start_with_t3(
     p: Prov,
     hosts: &[String],
     blob: Value,
     tx: Sender<(usize, Done)>,
     restart_t3: bool,
+    verify: bool,
 ) {
     if crate::demo::on() {
         return crate::demo::start(tx);
     }
     // Hosts come up to at least this machine's CLI along with its login.
     let want = crate::update::local(p);
+    let verify = verify && p == Prov::Claude && blob["setup_token"] == true;
     for (i, host) in hosts.iter().enumerate() {
         let (host, blob, tx, want) = (host.clone(), blob.clone(), tx.clone(), want.clone());
         thread::spawn(move || {
@@ -95,6 +99,10 @@ fn start_with_t3(
             result = crate::update::after_push(p, &host, want.as_deref(), result);
             if restart_t3 && p == Prov::Claude {
                 result = restart_t3_after(&host, result, "credentials installed");
+            }
+            if verify {
+                let t3 = if restart_t3 { T3::Need } else { T3::Note };
+                result = crate::check::after_push(&host, result, t3);
             }
             let _ = tx.send((i, result));
         });
@@ -163,10 +171,13 @@ esac
     )
 }
 
+pub(crate) const T3_RESTARTED: &str = "T3 restarted";
+const T3_SCHEDULED: &str = "T3 restart scheduled in 5s";
+
 fn t3_result(output: &str) -> Result<&'static str, &'static str> {
     match output.lines().last() {
-        Some("subs-t3: restarted") => Ok("T3 restarted"),
-        Some("subs-t3: scheduled") => Ok("T3 restart scheduled in 5s; reconnect T3"),
+        Some("subs-t3: restarted") => Ok(T3_RESTARTED),
+        Some("subs-t3: scheduled") => Ok(T3_SCHEDULED),
         Some("subs-t3: inactive") => Ok("T3 skipped (user service not active)"),
         Some("subs-t3: unavailable") => Ok("T3 skipped (systemctl unavailable)"),
         Some("subs-t3: hook-missing") => Err("T3 must load subs/claude-shell.sh at startup"),
@@ -174,18 +185,95 @@ fn t3_result(output: &str) -> Result<&'static str, &'static str> {
     }
 }
 
+/// Restart this machine's T3 now (`defer` false) or schedule it in 5s.
+fn t3_here(defer: bool) -> Result<&'static str, &'static str> {
+    let result = Command::new("sh").arg("-c").arg(t3_script(defer)).output();
+    match result {
+        Ok(out) if out.status.success() => t3_result(&String::from_utf8_lossy(&out.stdout)),
+        _ if defer => Err("T3 restart could not be scheduled"),
+        _ => Err("T3 restart failed"),
+    }
+}
+
+/// This command runs inside a T3 server on this machine (an agent, its
+/// terminal): restarting that T3 now would end the command with it.
+fn inside_t3() -> bool {
+    std::env::var_os("T3CODE_HOME").is_some()
+}
+
+pub(crate) fn here_name() -> String {
+    local_names()
+        .get(1)
+        .filter(|h| !h.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "localhost".into())
+}
+
+/// This machine last, after a setup-token push: its T3 restart when asked,
+/// then the same check as the hosts. From inside T3 the check comes first and
+/// the restart is scheduled, so it cannot cut this command short.
+fn finish_token_here(good: bool, restart_t3: bool, w: usize) -> bool {
+    let deferred = restart_t3 && inside_t3();
+    let restarted = (restart_t3 && !deferred).then(|| t3_here(false));
+    let t3 = match (deferred, restart_t3) {
+        (true, _) => T3::Skip,
+        (false, true) => T3::Need,
+        (false, false) => T3::Note,
+    };
+    let checked = crate::check::here(t3, matches!(restarted, Some(Ok(T3_RESTARTED))));
+    // Scheduled even when the check failed, as a remote failure never stops it.
+    let scheduled = deferred.then(|| t3_here(true));
+    let (mut parts, mut failed) = (vec![], false);
+    let mut add = |r: Result<String, String>| match r {
+        Ok(m) => parts.push(m),
+        Err(m) => {
+            failed = true;
+            parts.push(m)
+        }
+    };
+    if let Some(r) = restarted {
+        add(r.map(String::from).map_err(String::from));
+    }
+    add(match checked {
+        Done::Ok(m) => Ok(m),
+        Done::Failed(m) => Err(m),
+        Done::Offline => Err("check did not run".into()),
+    });
+    if let Some(r) = scheduled {
+        add(r
+            .map(|n| match n {
+                T3_SCHEDULED => format!("{n}; once T3 is back: subs check claude"),
+                n => n.to_string(),
+            })
+            .map_err(String::from));
+    }
+    let text = parts.join(" · ");
+    let name = here_name();
+    let w = w.max(name.len());
+    line(
+        &name,
+        w,
+        &if failed {
+            Done::Failed(text)
+        } else {
+            Done::Ok(text)
+        },
+    );
+    good && !failed
+}
+
 fn restart_local_t3() -> bool {
     if crate::demo::on() {
         return true;
     }
-    let result = Command::new("sh").arg("-c").arg(t3_script(true)).output();
-    let note = match result {
-        Ok(out) if out.status.success() => t3_result(&String::from_utf8_lossy(&out.stdout)),
-        _ => Err("T3 restart could not be scheduled"),
-    };
-    match note {
+    match t3_here(true) {
         Ok(note) => {
-            println!("  local: {note}");
+            let more = if note == T3_SCHEDULED {
+                "; reconnect T3"
+            } else {
+                ""
+            };
+            println!("  local: {note}{more}");
             true
         }
         Err(e) => {
@@ -284,25 +372,44 @@ pub(crate) fn exec(
     timeout: Duration,
     secret: bool,
 ) -> Result<String, Done> {
-    let mut c = Command::new("ssh")
+    let mut c = Command::new("ssh");
+    c.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=6",
+        "-o",
+        "RemoteCommand=none",
+        "-T",
+        "--",
+        host,
+        cmd,
+    ]);
+    run(c, input, timeout, secret, true)
+}
+
+/// `exec` on this machine: a `sh -s` script whose input holds a credential.
+pub(crate) fn exec_here(input: &str, timeout: Duration) -> Result<String, Done> {
+    let mut c = Command::new("sh");
+    c.arg("-s");
+    run(c, input, timeout, true, false)
+}
+
+fn run(
+    mut c: Command,
+    input: &str,
+    timeout: Duration,
+    secret: bool,
+    ssh: bool,
+) -> Result<String, Done> {
+    let name = if ssh { "ssh" } else { "sh" };
+    let mut c = c
         .env_remove("ANTHROPIC_API_KEY")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=6",
-            "-o",
-            "RemoteCommand=none",
-            "-T",
-            "--",
-            host,
-            cmd,
-        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Done::Failed(format!("ssh: {e}")))?;
+        .map_err(|e| Done::Failed(format!("{name}: {e}")))?;
     let (mut stdin, mut so, mut se) = (
         c.stdin.take().unwrap(),
         c.stdout.take().unwrap(),
@@ -350,7 +457,7 @@ pub(crate) fn exec(
     };
     match status {
         None => Err(Done::Failed("timed out".into())),
-        Some(s) if s.code() == Some(255) => {
+        Some(s) if ssh && s.code() == Some(255) => {
             let down = [
                 "timed out",
                 "No route",
@@ -506,13 +613,23 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
         }
     };
     let hosts = hosts(p);
+    // A setup-token is proven to work wherever it went, this machine last.
+    let token = p == Prov::Claude && blob["setup_token"] == true;
+    let w = hosts.iter().map(String::len).max().unwrap_or(0);
+    let finish = |good: bool| {
+        if token {
+            finish_token_here(good, restart_t3, w)
+        } else {
+            finish_t3(good, restart_t3)
+        }
+    };
     if hosts.is_empty() {
         println!(
             "{}: no hosts to push to · list them in {}",
             p.name(),
             config().display()
         );
-        return finish_t3(true, restart_t3);
+        return finish(true);
     }
     let email = if crate::demo::on() {
         crate::demo::ACTIVE.lock().unwrap().to_string()
@@ -526,7 +643,7 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
         if hosts.len() == 1 { "" } else { "s" }
     );
     let (tx, rx) = std::sync::mpsc::channel();
-    start_with_t3(p, &hosts, blob, tx, restart_t3);
+    start_with_t3(p, &hosts, blob, tx, restart_t3, true);
     let (ok, off, bad) = wait(&hosts, rx);
     println!();
     println!("{}", summary(ok, off.len(), bad, hosts.len()));
@@ -537,7 +654,27 @@ pub fn cli(p: Prov, restart_t3: bool) -> bool {
         println!("T3 keeps its environment until restarted · use --restart-t3 to restart active T3 user services");
     }
     // Even if one remote failed; only the source restarts here.
-    finish_t3(bad == 0, restart_t3)
+    finish(bad == 0)
+}
+
+fn paint(code: &str, s: &str) -> String {
+    let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var_os("NO_COLOR").is_none();
+    if color {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// One host's result line, its name padded to `w`.
+pub(crate) fn line(host: &str, w: usize, d: &Done) {
+    let h = format!("{host:<w$}");
+    match d {
+        Done::Ok(m) => println!("  {} {h}  {}", paint("32", "✓"), paint("90", m)),
+        Done::Offline => println!("  {} {h}  {}", paint("90", "○"), paint("90", "offline")),
+        Done::Failed(m) => println!("  {} {h}  {}", paint("31", "✗"), paint("31", m)),
+    }
 }
 
 /// Print each host's result as it lands, with one live line naming who is
@@ -548,13 +685,6 @@ pub(crate) fn wait(
 ) -> (usize, Vec<String>, usize) {
     let color = std::io::IsTerminal::is_terminal(&std::io::stdout())
         && std::env::var_os("NO_COLOR").is_none();
-    let paint = |code: &str, s: &str| {
-        if color {
-            format!("\x1b[{code}m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
-    };
     let w = hosts.iter().map(String::len).max().unwrap_or(0);
     let (mut ok, mut off, mut bad) = (0, vec![], 0);
     let live = color && std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -586,20 +716,11 @@ pub(crate) fn wait(
         if live {
             print!("\r\x1b[K");
         }
-        let h = format!("{:<w$}", hosts[i]);
+        line(&hosts[i], w, &d);
         match d {
-            Done::Ok(m) => {
-                ok += 1;
-                println!("  {} {h}  {}", paint("32", "✓"), paint("90", &m));
-            }
-            Done::Offline => {
-                off.push(hosts[i].clone());
-                println!("  {} {h}  {}", paint("90", "○"), paint("90", "offline"));
-            }
-            Done::Failed(m) => {
-                bad += 1;
-                println!("  {} {h}  {}", paint("31", "✗"), paint("31", &m));
-            }
+            Done::Ok(_) => ok += 1,
+            Done::Offline => off.push(hosts[i].clone()),
+            Done::Failed(_) => bad += 1,
         }
     }
     (ok, off, bad)

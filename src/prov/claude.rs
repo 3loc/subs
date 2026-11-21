@@ -27,6 +27,18 @@ impl std::fmt::Debug for Token {
     }
 }
 
+impl Token {
+    /// `cat > FILE` of the token, for a script that compares against it.
+    pub(crate) fn heredoc(&self, file: &str) -> String {
+        crate::push::heredoc(file, &self.value)
+    }
+
+    /// The account the user labelled the token with.
+    pub(crate) fn email(&self) -> Option<&str> {
+        self.account_email.as_deref()
+    }
+}
+
 pub(crate) fn token_path() -> PathBuf {
     env_path("XDG_CONFIG_HOME")
         .unwrap_or_else(|| home().join(".config"))
@@ -403,16 +415,38 @@ enum Input {
     Fail(String),
 }
 
+/// Where the code from the sign-in page comes from.
+pub(crate) enum Code {
+    /// A hidden prompt on the terminal.
+    Prompt,
+    /// One line on stdin.
+    Stdin,
+    /// A file that appears at this path once the user has signed in: how an
+    /// agent hands over the code without a terminal. It is read once and removed.
+    File(PathBuf),
+}
+
 /// Create a long-lived token with Claude's own `claude setup-token` browser flow.
 /// It runs on a private terminal in a throwaway config: only the sign-in link is
 /// shown, and the token replaces nothing until it has answered a real request.
-/// The code from the sign-in page is read hidden when `prompt`, else as one line
-/// on stdin. A model-only token cannot name its account: `email` is the label.
-pub(crate) fn login_token(email: Option<&str>, prompt: bool) -> Result<String, String> {
+/// A model-only token cannot name its account: `email` is the label.
+pub(crate) fn login_token(email: Option<&str>, code: Code) -> Result<String, String> {
     if let Some(email) = email {
         validate_email(email)?;
     }
-    let value = scratch(".login-token-", |dir| setup_token(dir, email, prompt))?;
+    if let Code::File(path) = &code {
+        // A leftover would be taken as this sign-in's code; never delete it for the user.
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(format!(
+                "{} already exists; remove it or name a new path for the code",
+                path.display()
+            ));
+        }
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Err(format!("no directory for the code file {}", path.display()));
+        }
+    }
+    let value = scratch(".login-token-", |dir| setup_token(dir, email, code))?;
     eprintln!("claude: checking the new token with one small request");
     scratch(".login-check-", |dir| check(dir, &value))?;
     install_new(value, email)?;
@@ -434,7 +468,37 @@ fn scratch<T>(prefix: &str, f: impl FnOnce(&Path) -> Result<T, String>) -> Resul
     r
 }
 
-fn setup_token(dir: &Path, email: Option<&str>, prompt: bool) -> Result<String, String> {
+/// Wait for the code file, then take it: once its size has held still, so a
+/// half-written file is not read, and only a private regular file of ours.
+fn code_file(path: &Path, stop: &AtomicBool) -> Option<Input> {
+    let mut seen = None;
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(250));
+        let Ok(m) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !m.is_file() || m.uid() != unsafe { libc::getuid() } {
+            return Some(Input::Fail(format!(
+                "{} is not a regular file of yours; the current login is unchanged",
+                path.display()
+            )));
+        }
+        if m.len() == 0 || seen != Some(m.len()) {
+            seen = Some(m.len());
+            continue;
+        }
+        let mut s = String::new();
+        let read = fs::File::open(path).and_then(|f| f.take(4096).read_to_string(&mut s));
+        let _ = fs::remove_file(path);
+        return Some(match read {
+            Ok(_) => Input::Code(s),
+            Err(_) => Input::Fail(format!("cannot read {}", path.display())),
+        });
+    }
+    None
+}
+
+fn setup_token(dir: &Path, email: Option<&str>, code: Code) -> Result<String, String> {
     let mut cmd = login_command();
     cmd.arg("setup-token")
         .env("CLAUDE_CONFIG_DIR", dir)
@@ -462,34 +526,50 @@ fn setup_token(dir: &Path, email: Option<&str>, prompt: bool) -> Result<String, 
     eprintln!("claude: open this link and sign in{who} to create a long-lived subscription token:\n\n{url}\n");
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    let reader = if prompt {
-        eprintln!(
-            "then paste the code the page shows; a browser on this machine finishes by itself"
-        );
-        let stop = stop.clone();
-        Some(thread::spawn(move || {
-            let r = crate::actions::read_secret_until("code (hidden): ", &|| {
-                stop.load(Ordering::Relaxed)
+    let reader = match code {
+        Code::Prompt => {
+            eprintln!(
+                "then paste the code the page shows; a browser on this machine finishes by itself"
+            );
+            let stop = stop.clone();
+            Some(thread::spawn(move || {
+                let r = crate::actions::read_secret_until("code (hidden): ", &|| {
+                    stop.load(Ordering::Relaxed)
+                });
+                let _ = tx.send(match r {
+                    Ok(Some(code)) => Input::Code(code),
+                    Ok(None) => return,
+                    Err(e) => Input::Fail(e),
+                });
+            }))
+        }
+        Code::File(path) => {
+            eprintln!(
+                "then write the code the page shows to {}; it is read once and removed",
+                path.display()
+            );
+            let stop = stop.clone();
+            Some(thread::spawn(move || {
+                if let Some(i) = code_file(&path, &stop) {
+                    let _ = tx.send(i);
+                }
+            }))
+        }
+        Code::Stdin => {
+            eprintln!("then send the code the page shows as one line on stdin");
+            thread::spawn(move || {
+                let mut s = String::new();
+                let read = io::stdin().lock().take(4096).read_line(&mut s);
+                let _ = tx.send(match read {
+                    Ok(n) if n > 0 => Input::Code(s),
+                    _ => Input::Fail(
+                        "stdin closed before the code arrived; the current login is unchanged"
+                            .into(),
+                    ),
+                });
             });
-            let _ = tx.send(match r {
-                Ok(Some(code)) => Input::Code(code),
-                Ok(None) => return,
-                Err(e) => Input::Fail(e),
-            });
-        }))
-    } else {
-        eprintln!("then send the code the page shows as one line on stdin");
-        thread::spawn(move || {
-            let mut s = String::new();
-            let read = io::stdin().lock().take(4096).read_line(&mut s);
-            let _ = tx.send(match read {
-                Ok(n) if n > 0 => Input::Code(s),
-                _ => Input::Fail(
-                    "stdin closed before the code arrived; the current login is unchanged".into(),
-                ),
-            });
-        });
-        None
+            None
+        }
     };
     let r = wait_token(&mut term, &mut screen, &rx);
     stop.store(true, Ordering::Relaxed);

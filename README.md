@@ -28,6 +28,10 @@ subs tui                                # interactive view
 subs login codex|claude|cursor [EMAIL]  # sign in; --use makes it active and pushes it
                                         # (signing in as the active account always does)
 subs login claude EMAIL --token         # long-lived Claude token via the browser, checked
+subs login claude EMAIL --token --use --restart-t3
+                                        # all of it: sign in, push everywhere, restart T3,
+                                        # and prove Claude answers on every machine
+subs check claude                       # prove the token works here and on every host
 subs label claude EMAIL                 # name the installed token's account
 subs use codex|claude|cursor EMAIL      # make a saved login active and push it to your hosts
 subs push codex|claude|cursor           # push the active login to your hosts again
@@ -45,6 +49,56 @@ TUI keys: `j`/`k` move, `enter` use (and push), `f` push again, `l` login, `n` n
 `t` long-lived Claude token for the account, `a` password, `p` copy password,
 `d` delete, `r` refresh, `q` quit. On a `[token]` card, `l` creates a new token
 for it; the new token goes out to your hosts once checked and installed.
+
+## Switch Claude everywhere
+
+One command signs in to a Claude account and puts it on every machine and every
+T3 server:
+
+```sh
+subs login claude you@example.com --token --use --restart-t3
+```
+
+It creates a long-lived subscription token in the browser, checks it with one
+small request, installs it here, pushes it to every host (bringing each host's
+`claude` up to this machine's version), restarts the active T3 servers, and then
+proves it took: on each machine, a fresh shell asks Claude for one short reply
+with the new token, and each running T3 server must have been started with that
+same token. Each host's line ends with `Claude replies · T3 has the token`, or
+with what failed. The exit status is nonzero when a reachable machine fails.
+
+This machine goes last. Run from a terminal, its T3 restarts and is checked
+like the hosts. Run from inside T3 (an agent or a T3 terminal: `T3CODE_HOME` is
+set), restarting now would end the command with it, so it checks Claude here,
+schedules the restart for five seconds later, and exits. Once T3 is back:
+
+```sh
+subs check claude
+```
+
+`subs check claude` changes nothing. It makes the same check here and on every
+host, one small request each, and reports T3 servers still running an older
+token, a host with a different token, a rejected token, or a usage limit.
+`--local` checks only this machine. Only the managed setup-token is checked: a
+request with a shared OAuth login could refresh, and so rotate, it. A plain
+`subs push claude` of a token checks each host too, but only notes a T3 that
+still has the older token, since it was not asked to restart it.
+
+### From an agent
+
+Without a terminal, `--code-file=PATH` waits for the sign-in page's code to
+appear in that file, reads it once and removes it. The path must not exist yet.
+
+```sh
+subs login claude you@example.com --token --code-file="$PWD/claude-code" \
+  --use --restart-t3 > login.log 2>&1 &
+# login.log shows the sign-in link; open it and sign in as that account.
+# Put the code the page shows into place in one step:
+cat /private/code-from-the-user > claude-code.part && mv claude-code.part claude-code
+wait
+```
+
+The link goes to stderr, the code never does; nothing in the log is secret.
 
 ## Hosts
 
@@ -79,9 +133,11 @@ subs login claude you@example.com --use --restart-t3
 
 This is opt-in because it interrupts active T3 runs. Remote services restart
 only after their credential installation succeeds; an inactive service stays
-inactive. The source machine schedules its restart five seconds after fanout
-finishes, so a push launched inside T3 can finish first. Output distinguishes
-restarted, scheduled, skipped, and failed restarts. A restart failure returns a
+inactive. The source machine restarts last. For a setup-token outside T3 it
+restarts at once and is checked; inside T3, and for OAuth logins, it is
+scheduled five seconds after fanout finishes, so a push launched inside T3 can
+finish first. Output distinguishes restarted, scheduled, skipped, and failed
+restarts. A restart failure returns a
 nonzero exit status even when the credentials were installed. This option is for CLI Claude fanout and
 cannot be combined with `--local`; normal pushes and the TUI do not restart T3.
 
@@ -108,10 +164,10 @@ neither supported service manager are reported as skipped.
 
 Checkpoint running agents before opting into a restart. Files and independent
 jobs survive; commands owned by a T3 process may need to run again. A confirmed
-service restart does not prove the app has finished database migrations or that
-a model request succeeds. Check the T3 connection and run a small request from a
-fresh Claude session before resuming unfinished work. Do not repeat completed
-tasks just because their earlier failure notices remain visible.
+service restart does not prove the app has finished database migrations; the
+setup-token check proves a fresh request works and that T3 started with the
+token. Check the T3 connection before resuming unfinished work. Do not repeat
+completed tasks just because their earlier failure notices remain visible.
 
 Data lives in `~/.local/share/subs` (`$SUBS_HOME` overrides): mode 0700,
 passwords in plain text at 0600.

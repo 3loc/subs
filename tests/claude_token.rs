@@ -8,6 +8,14 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const FAKE: &str = "sk-ant-oat01-FAKE-integration-test-only";
+const CHECK_ONLY: &str = r#"test "${ANTHROPIC_API_KEY+x}" != x
+case "$*" in
+  '-p --tools  --model haiku --strict-mcp-config --no-session-persistence')
+    test "$CLAUDE_CODE_OAUTH_TOKEN" = sk-ant-oat01-FAKE-integration-test-only || exit 7
+    case "$(cat)" in *ok*) printf 'ok\n';; *) exit 5;; esac ;;
+  *) exit 1 ;;
+esac
+"#;
 
 struct Fixture(PathBuf);
 
@@ -29,11 +37,17 @@ impl Fixture {
             "ssh",
             "codex",
             "cursor-agent",
-            "claude",
             "security",
+            // Never this user's real T3 or its services.
+            "systemctl",
+            "systemd-run",
+            "launchctl",
+            "ps",
         ] {
             f.stub(tool, "exit 1\n");
         }
+        // Only the token check's small request is answered.
+        f.stub("claude", CHECK_ONLY);
         // Host-platform branches must never reach this user's real services/keychain.
         f.stub("uname", "printf 'Linux\\n'\n");
         f
@@ -62,9 +76,13 @@ impl Fixture {
         c
     }
     fn run(&self, args: &[&str], input: &str) -> Output {
+        self.run_with(args, input, &[])
+    }
+    fn run_with(&self, args: &[&str], input: &str, env: &[(&str, &str)]) -> Output {
         let mut c = self
             .command()
             .args(args)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -104,8 +122,32 @@ impl Fixture {
     }
 }
 
+impl Fixture {
+    /// A stand-in for a running T3 server started with `token`; the stubbed
+    /// service managers report its pid.
+    fn t3_server(&self, token: &str) {
+        self.stop_t3();
+        // Detached, so nothing here has to reap it.
+        let out = Command::new("sh")
+            .args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", token)
+            .output()
+            .unwrap();
+        fs::write(self.0.join("t3-pid"), out.stdout).unwrap();
+    }
+    fn stop_t3(&self) {
+        if let Ok(pid) = fs::read_to_string(self.0.join("t3-pid")) {
+            let _ = Command::new("kill").arg(pid.trim()).status();
+            let _ = fs::remove_file(self.0.join("t3-pid"));
+        }
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.stop_t3();
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -463,6 +505,7 @@ printf '%s:%s\n' "$HOME" "$*" >> "$TEST_REMOTE_HOME/../t3-calls"
 case "$*" in
   '--user is-active --quiet t3code.service') exit "${TEST_T3_INACTIVE:-0}" ;;
   '--user show t3code.service -p ExecStart --value') printf '%s\n' 'source subs/claude-shell.sh'; exit 0 ;;
+  '--user show t3code.service -p MainPID --value') cat "$TEST_REMOTE_HOME/../t3-pid"; exit 0 ;;
   '--user restart t3code.service')
     test -f "$HOME/.config/subs/claude.env"
     exit "${TEST_T3_RESTART_FAIL:-0}" ;;
@@ -470,6 +513,7 @@ case "$*" in
 esac
 "#,
     );
+    f.t3_server(FAKE);
     f.stub(
         "systemd-run",
         r#"
@@ -485,8 +529,18 @@ fn t3_restart_is_opt_in_and_source_is_scheduled_after_remote_restart() {
     mock_t3(&f);
     assert!(f.run(&["push", "claude"], "").status.success());
     let log = f.0.join("t3-calls");
-    assert!(!log.exists(), "normal pushes must not touch T3");
-    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("restart") && !calls.contains("scheduled"),
+        "normal pushes must not restart T3"
+    );
+    let _ = fs::remove_file(&log);
+    // Run from inside T3: this machine's restart must wait for the command to end.
+    let out = f.run_with(
+        &["push", "claude", "--restart-t3"],
+        "",
+        &[("T3CODE_HOME", "/nonexistent")],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -541,6 +595,18 @@ fn mock_macos_t3(f: &Fixture) {
     f.hosts();
     f.stub("uname", "printf 'Darwin\\n'\n");
     f.stub("ssh", "HOME=\"$TEST_REMOTE_HOME\" XDG_CONFIG_HOME=\"$TEST_REMOTE_HOME/.config\" exec /bin/sh -s\n");
+    // A Mac's running T3, as ps shows it: arguments, then the environment.
+    f.stub(
+        "ps",
+        &format!(
+            r#"case "$*" in
+  '-x -o pid=,command=') printf '4242 /opt/example/t3 serve --port 3773\n' ;;
+  '-E -ww -p 4242 -o command=') printf '/opt/example/t3 serve --port 3773 HOME=/x CLAUDE_CODE_OAUTH_TOKEN={FAKE}\n' ;;
+  *) exit 1 ;;
+esac
+"#
+        ),
+    );
     for home in [&f.0, &f.0.join("remote")] {
         let dir = home.join("Library/LaunchAgents");
         fs::create_dir_all(&dir).unwrap();
@@ -574,7 +640,11 @@ fn macos_t3_discovers_labels_preserves_preferences_and_retries_bootstrap() {
     let f = Fixture::new();
     mock_macos_t3(&f);
     for _ in 0..2 {
-        let out = f.run(&["push", "claude", "--restart-t3"], "");
+        let out = f.run_with(
+            &["push", "claude", "--restart-t3"],
+            "",
+            &[("T3CODE_HOME", "/nonexistent")],
+        );
         assert!(
             out.status.success(),
             "{}",
@@ -615,12 +685,11 @@ fn macos_t3_does_not_start_inactive_jobs_or_hide_scheduling_failures() {
         .command()
         .args(["push", "claude", "--restart-t3"])
         .env("TEST_SCHEDULE_FAIL", "1")
+        .env("T3CODE_HOME", "/nonexistent")
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("local T3 restart could not be scheduled")
-    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("T3 restart could not be scheduled"));
 }
 
 #[test]
@@ -663,13 +732,29 @@ fn t3_restart_skips_inactive_services_and_failed_installations() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("T3 skipped"));
     assert!(!f.0.join("t3-calls").exists());
+    // Inside T3, an inactive local service is still not claimed as scheduled.
+    let out = f.run_with(
+        &["push", "claude", "--restart-t3"],
+        "",
+        &[("T3CODE_HOME", "/nonexistent")],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("scheduled"), "{text}");
 
     mock_t3(&f);
     f.stub("ssh", "cat >/dev/null; exit 3\n");
     let out = f.run(&["push", "claude", "--restart-t3"], "");
     assert!(!out.status.success());
     let calls = fs::read_to_string(f.0.join("t3-calls")).unwrap_or_default();
-    assert!(!calls.contains("--user restart t3code.service"));
+    let remote = format!(
+        "{}:--user restart t3code.service",
+        f.0.join("remote").display()
+    );
+    assert!(
+        !calls.contains(&remote),
+        "a failed host must not restart its T3"
+    );
 }
 
 #[test]
@@ -697,9 +782,11 @@ fn remote_failure_or_echo_cannot_leak_the_token() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("remote credential installation failed"));
     f.stub(
         "ssh",
-        &format!("cat >/dev/null; printf 'subs: {FAKE}\\n'\n"),
+        &format!("cat >/dev/null; printf 'subs: {FAKE}\\nsubs-check: token {FAKE}\\n'\n"),
     );
-    assert!(f.run(&["push", "claude"], "").status.success());
+    let out = f.run(&["push", "claude"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Claude check did not finish"));
 }
 
 #[test]
@@ -1075,4 +1162,133 @@ fn token_flags_are_only_accepted_where_they_mean_something() {
         );
     }
     assert!(!f.env_path().exists());
+}
+
+#[test]
+fn token_push_proves_each_host_and_restarts_this_machine_last() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    let out = f.run(&["push", "claude", "--restart-t3"], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    // The host, then this machine: each restarted, answering, and T3 holding the token.
+    assert_eq!(text.matches("T3 restarted").count(), 2, "{text}");
+    assert_eq!(
+        text.matches("Claude replies · T3 has the token").count(),
+        2,
+        "{text}"
+    );
+    let calls = fs::read_to_string(f.0.join("t3-calls")).unwrap();
+    let remote = format!("{}:--user restart", f.0.join("remote").display());
+    let here = format!("{}:--user restart", f.0.display());
+    assert!(calls.find(&remote).unwrap() < calls.find(&here).unwrap());
+    assert!(!calls.contains("scheduled:"), "outside T3 nothing waits");
+}
+
+#[test]
+fn check_names_a_stale_t3_a_different_token_and_a_rejected_one() {
+    let f = Fixture::new();
+    mock_t3(&f);
+    assert!(f.run(&["push", "claude"], "").status.success());
+    let out = f.run(&["check", "claude"], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("working on 2 of 2"), "{text}");
+
+    // T3 started before the token changed: noted by a plain push, a failure for check.
+    f.t3_server("sk-ant-oat01-OLD-token-from-before");
+    let out = f.run(&["push", "claude"], "");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("older token · --restart-t3"));
+    let out = f.run(&["check", "claude"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("T3 still runs an older token"));
+    f.t3_server(FAKE);
+
+    let remote = f.0.join("remote/.config/subs/claude.env");
+    let env = fs::read_to_string(&remote).unwrap();
+    fs::write(&remote, env.replace(FAKE, "sk-ant-oat01-SOMEONE-else")).unwrap();
+    let out = f.run(&["check", "claude"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("has a different Claude token"));
+    fs::write(&remote, env).unwrap();
+
+    f.stub(
+        "claude",
+        "cat >/dev/null; printf 'Invalid API key · Please run /login\\n'; exit 1\n",
+    );
+    let out = f.run(&["check", "claude", "--local"], "");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(text.contains("Claude rejected the token") && !text.contains("Invalid API key"));
+    assert_eq!(text.matches("rejected").count(), 1, "--local is only here");
+}
+
+#[test]
+fn check_needs_a_setup_token_and_only_claude() {
+    let f = Fixture::new();
+    let out = f.run(&["check", "claude"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no Claude subscription token"));
+    let out = f.run(&["check", "codex"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: subs check claude"));
+}
+
+#[test]
+fn code_file_hands_over_the_sign_in_code_without_a_terminal() {
+    let f = Fixture::new();
+    fake_claude(&f, FAKE, "printf 'ok\\n'");
+    let code = f.0.join("code");
+    fs::write(&code, "stale").unwrap();
+    let arg = format!("--code-file={}", code.display());
+    let out = f.run(
+        &[
+            "login",
+            "claude",
+            "a@example.invalid",
+            "--token",
+            &arg,
+            "--local",
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    assert_eq!(
+        fs::read_to_string(&code).unwrap(),
+        "stale",
+        "never deleted for the user"
+    );
+    fs::remove_file(&code).unwrap();
+
+    let child = f
+        .command()
+        .args([
+            "login",
+            "claude",
+            "a@example.invalid",
+            "--token",
+            &arg,
+            "--local",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    // An agent writes it beside, then renames it into place.
+    fs::write(f.0.join("code.part"), CODE).unwrap();
+    fs::rename(f.0.join("code.part"), &code).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains(&format!("\n{URL}\n")), "{stderr}");
+    assert!(stderr.contains("write the code the page shows to"));
+    assert!(!stderr.contains(CODE) && !stderr.contains("sk-ant-"));
+    assert_eq!(fs::read_to_string(f.0.join("code-seen")).unwrap(), CODE);
+    assert!(!code.exists(), "the code is removed once read");
+    assert!(fs::read_to_string(f.env_path()).unwrap().contains(FAKE));
+    no_leftovers(&f);
 }

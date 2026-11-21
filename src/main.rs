@@ -14,6 +14,7 @@
 //! that stays the job of the real CLI, which runs against the live file.
 
 mod actions;
+mod check;
 mod demo;
 mod prov;
 mod pty;
@@ -40,7 +41,15 @@ usage: subs [command]
                                           browser, check it, then install it for EMAIL;
                                           --use also pushes it to your hosts. Without a
                                           terminal: --browser takes the page's code on
-                                          stdin, else stdin is an existing token
+                                          stdin, --code-file=PATH waits for it in that
+                                          file (for agents), else stdin is a token
+  subs login claude EMAIL --token --use --restart-t3
+                                          all of it: sign in, check, install, push to
+                                          every host, restart T3 everywhere, and prove
+                                          Claude answers on each with the new token
+  subs check claude                       prove the token works here and on every host:
+                                          one small request each, and T3 started with it
+                                          (--local: just here)
   subs label claude EMAIL                 name the installed token's account
   subs use   codex|claude|cursor EMAIL    make a saved login the active one and push
                                           it to your hosts (--local: just this machine;
@@ -62,8 +71,9 @@ the providers it takes (\"laptop claude\"). Offline hosts are skipped.
 Claude fanout and update: --restart-t3 reloads active T3 systemd services or
 macOS LaunchAgents after installation, since T3 keeps the credentials and CLI
 version it saw at startup. macOS reloads need Python 3; service labels come from
-existing user configuration. The local restart is scheduled last. This
-interrupts active T3 runs.";
+existing user configuration. This machine restarts last, and only after its
+own check; run from inside T3 it is scheduled for 5s later instead, so confirm
+with subs check claude once T3 is back. This interrupts active T3 runs.";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("subs: {msg}");
@@ -163,6 +173,12 @@ fn main() {
     };
     let email = args.get(1).copied();
     let flag = |f: &str| argv.iter().any(|a| a == f);
+    if cmd == "check" {
+        if p != Prov::Claude || args.len() != 1 {
+            die("usage: subs check claude [--local] (only Claude's setup-token can be checked)");
+        }
+        exit(if check::cli(flag("--local")) { 0 } else { 1 });
+    }
     if flag("--restart-t3")
         && (p != Prov::Claude || !matches!(cmd, "push" | "use" | "login") || flag("--local"))
     {
@@ -179,15 +195,23 @@ fn main() {
             exit(1)
         }
     };
-    if flag("--token") || flag("--browser") {
+    if flag("--code-file") {
+        die("give the path with an equals sign: --code-file=PATH");
+    }
+    let code_file = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--code-file="))
+        .map(|f| std::env::current_dir().unwrap_or_default().join(f));
+    if flag("--token") || flag("--browser") || code_file.is_some() {
         if cmd != "login" || p != Prov::Claude || !flag("--token") {
-            die("usage: subs login claude EMAIL --token [--browser] [--use] [--local]");
+            die("usage: subs login claude EMAIL --token [--browser | --code-file=PATH] [--use [--restart-t3]] [--local]");
         }
-        let tty = io::stdin().is_terminal();
-        report(if tty || flag("--browser") {
-            prov::claude::login_token(email, tty)
-        } else {
-            prov::claude::install_token(email)
+        use prov::claude::Code;
+        report(match code_file {
+            Some(f) => prov::claude::login_token(email, Code::File(f)),
+            None if io::stdin().is_terminal() => prov::claude::login_token(email, Code::Prompt),
+            None if flag("--browser") => prov::claude::login_token(email, Code::Stdin),
+            None => prov::claude::install_token(email),
         });
         return fan(flag("--use"));
     }
